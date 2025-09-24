@@ -2,6 +2,8 @@ import time
 import numpy as np
 import pandas as pd
 import streamlit as st
+import requests, re
+
 
 # --- tiny helper to import on first use (avoids long import delay before UI renders)
 @st.cache_resource
