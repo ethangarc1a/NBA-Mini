@@ -797,21 +797,18 @@ else:
 with st.expander("Methodology & notes"):
     st.markdown(
         textwrap.dedent(
-            f"""
+            """
             - **Data**: Primary from `stats.nba.com` PBP; fallback to `data.nba.net` when needed.
             - **Win Probability**: transparent logistic baseline using score differential and time remaining factor.
-              This is intentionally simple and stable for reproducible demos (PDF, pp. 1–3, 8–9). :contentReference[oaicite:4]{index=4}
+              This is intentionally simple and stable for reproducible demos (PDF pp. 1–3, 8–9).
             - **Bonus detection**: reaches at **5 team fouls in a quarter**; shaded spans indicate periods where defensive fouls
-              ipso facto yield free throws, inflating opponent scoring rate (PDF, pp. 5–7). :contentReference[oaicite:5]{index=5}
-            - **Expected FT points**: we visualize the idea that a **shooting foul yields ≈1.55 points** on average (league FT ~76%);
-              used for quick intuition on foul cost (PDF, pp. 5–7). :contentReference[oaicite:6]{index=6}
+              ipso facto yield free throws, inflating opponent scoring rate (PDF pp. 5–7).
+            - **Expected FT points**: we visualize that a **shooting foul yields ≈1.55 points** on average (league FT ~76%);
+              used for quick intuition on foul cost (PDF pp. 5–7).
             - **Foul-trouble flags**: 2 in Q1, 3 by half, 5 in Q4+ highlight common coaching thresholds and their WP implications
-              discussed in your report (PDF, pp. 3–6). :contentReference[oaicite:7]{index=7}
+              discussed in your report (PDF pp. 3–6).
             - **% calls toward HOME**: computed from which side’s description contains the foul text; it’s an approximation but
               works well for live display and resume-ready demos.
             """
         )
     )
-
-# End of file
-
