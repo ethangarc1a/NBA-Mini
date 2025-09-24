@@ -7,3 +7,4 @@ scipy
 matplotlib
 seaborn
 requests
+nba_api
