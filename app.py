@@ -93,45 +93,110 @@ def detect_foul_flags(row: pd.Series) -> tuple[bool, str]:
     return is_foul, ftype
 
 @st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_game(game_id: str) -> pd.DataFrame:
-    pbp_endpoint = _nba_endpoint()
-    # be nice to the API
-    time.sleep(0.6)
-    df = pbp_endpoint.PlayByPlayV2(game_id=game_id).get_data_frames()[0].copy()
-    if df.empty:
-        raise ValueError("Empty play-by-play for this GAME_ID.")
-    # Keep the essentials
-    keep_cols = [
-        "GAME_ID","EVENTNUM","PERIOD","PCTIMESTRING","SCORE",
-        "HOMEDESCRIPTION","VISITORDESCRIPTION","NEUTRALDESCRIPTION"
-    ]
-    df = df[keep_cols].copy()
+    """
+    Loads play-by-play from NBA CDN (works better on Streamlit Cloud).
+    URL pattern: https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_<GAME_ID>.json
+    Returns a DataFrame with the same columns your app expects.
+    """
+    url = f"https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_{game_id}.json"
 
-    # Time
+    # simple retry
+    last_err = None
+    for i in range(4):
+        try:
+            r = requests.get(url, timeout=20)
+            if r.status_code == 200:
+                data = r.json()
+                break
+            last_err = RuntimeError(f"HTTP {r.status_code}")
+        except Exception as e:
+            last_err = e
+        time.sleep(0.8 * (i + 1))
+    else:
+        raise ValueError(f"Failed to fetch CDN play-by-play: {last_err}")
+
+    actions = (data or {}).get("game", {}).get("actions", [])
+    if not actions:
+        raise ValueError("CDN returned no play-by-play actions for this GAME_ID.")
+
+    # Helper: normalize clock to "MM:SS"
+    def clock_to_mmss(clock_val) -> str:
+        if not clock_val:
+            return "00:00"
+        s = str(clock_val)
+        # Handle ISO8601-like "PT11M25.00S"
+        m = re.match(r"^PT(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$", s)
+        if m:
+            mm = int(m.group(1) or 0)
+            ss = float(m.group(2) or 0.0)
+            return f"{mm:02d}:{int(round(ss)):02d}"
+        # Handle "11:25" already
+        if re.match(r"^\d{1,2}:\d{2}$", s):
+            return s
+        # Fallback: strip decimals like "11:25.0"
+        if re.match(r"^\d{1,2}:\d{2}\.\d+$", s):
+            base = s.split(".")[0]
+            return base
+        return "00:00"
+
+    rows = []
+    for a in actions:
+        period = int(a.get("period", 0) or 0)
+        pctimestr = clock_to_mmss(a.get("clock"))
+        # scoreHome/scoreAway are usually integers; guard just in case
+        sh = a.get("scoreHome")
+        sa = a.get("scoreAway")
+        try:
+            sh = int(sh) if sh is not None else None
+        except Exception:
+            sh = None
+        try:
+            sa = int(sa) if sa is not None else None
+        except Exception:
+            sa = None
+
+        desc = a.get("description") or ""
+        # Keep columns compatible with the rest of the app
+        rows.append({
+            "GAME_ID": str(game_id),
+            "EVENTNUM": int(a.get("actionNumber", 0) or 0),
+            "PERIOD": period,
+            "PCTIMESTRING": pctimestr,
+            "SCORE": (f"{sh} - {sa}" if sh is not None and sa is not None else None),
+            "HOMEDESCRIPTION": None,          # CDN gives a single description; we put it in NEUTRAL
+            "VISITORDESCRIPTION": None,
+            "NEUTRALDESCRIPTION": desc,
+            "home_score": sh,
+            "away_score": sa,
+        })
+
+    df = pd.DataFrame(rows).sort_values(["PERIOD","EVENTNUM"]).reset_index(drop=True)
+
+    # Derive fields used later in your app
     df["sec_remaining"] = df.apply(
         lambda r: parse_period_clock_to_secs_left(int(r["PERIOD"]), str(r["PCTIMESTRING"])), axis=1
     )
 
-    # Scores forward-fill then split
+    # If SCORE was missing on some early rows, forward fill from the numeric columns
     df["SCORE"] = df["SCORE"].ffill()
-    ha = df["SCORE"].apply(split_score_to_home_away)
-    df["home_score"] = ha.apply(lambda t: t[0])
-    df["away_score"] = ha.apply(lambda t: t[1])
-    # Valid rows only for WP curve
+    if df["home_score"].isna().any() or df["away_score"].isna().any():
+        df["home_score"] = df["home_score"].ffill()
+        df["away_score"] = df["away_score"].ffill()
+
+    # Now continue like before
     df["score_margin"] = df["home_score"] - df["away_score"]
 
-    # Foul flags
+    # Reuse your existing foul detection, WP, etc.
     flags = df.apply(detect_foul_flags, axis=1, result_type="expand")
     df["is_foul"] = flags[0]
     df["foul_type"] = flags[1].fillna("")
 
-    # Win prob (home) — only where we have scores
     mask = df["home_score"].notna() & df["away_score"].notna()
     df["wp_home"] = np.nan
-    df.loc[mask, "wp_home"] = quick_wp_home(df.loc[mask,"score_margin"], df.loc[mask,"sec_remaining"])
+    df.loc[mask, "wp_home"] = quick_wp_home(df.loc[mask, "score_margin"], df.loc[mask, "sec_remaining"])
 
-    # Observed ΔWP relative to next event
-    df = df.sort_values(["PERIOD","EVENTNUM"]).reset_index(drop=True)
     df["wp_next"] = df["wp_home"].shift(-1).fillna(method="ffill")
     df["dwp_obs"] = df["wp_next"] - df["wp_home"]
 
