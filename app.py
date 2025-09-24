@@ -1,757 +1,663 @@
+# app.py
+# RefLens Mobile — Fouls & Win Probability (Free APIs; Regular Season + Playoffs)
+# - Single-file Streamlit app
+# - NBA play-by-play via nba_api (free)
+# - Win Probability (baseline logistic) + foul markers + bonus detection
+# - ΔWP around fouls (quick local counterfactual)
+# - Team & Player views; mobile-friendly layout
+#
+# Notes:
+# - This uses a simple, transparent baseline WP model (time + score diff).
+# - NBA in-game "official WP" endpoint is not publicly exposed through nba_api;
+#   so we compute a baseline to keep it free & reproducible.
+# - Playoffs included (scoreboard returns all scheduled games for the date).
+#
+# If stats.nba.com times out (rare), retry via the "Reload data" button.
+
 import time
+import math
+import re
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-import requests
-import re
-from datetime import datetime, timezone
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# Try to import plotly, fall back to basic charts if not available
-try:
-    import plotly.graph_objects as go
-    import plotly.express as px
-    PLOTLY_AVAILABLE = True
-except ImportError:
-    PLOTLY_AVAILABLE = False
-    st.warning("⚠️ Plotly not available. Using basic charts.")
+# --- NBA API (lazy import to avoid initial UI lag)
+@st.cache_resource
+def _nba_endpoints():
+    from nba_api.stats.endpoints import scoreboardv2, playbyplayv2, boxscoretraditionalv2
+    from nba_api.stats.library.parameters import DayOffset
+    return scoreboardv2, playbyplayv2, boxscoretraditionalv2, DayOffset
 
-# ---- Streamlit setup
-st.set_page_config(page_title="RefLens Pro - NBA Game Analytics", layout="wide")
+ScoreboardV2, PlayByPlayV2, BoxScoreTraditionalV2, DayOffset = _nba_endpoints()
 
-# Custom CSS
-st.markdown("""
-<style>
-    .metric-container {
-        background-color: #f0f2f6;
-        padding: 15px;
-        border-radius: 10px;
-        margin: 10px 0;
-    }
-    .game-header {
-        background: linear-gradient(90deg, #1f77b4, #ff7f0e);
-        color: white;
-        padding: 20px;
-        border-radius: 10px;
-        margin-bottom: 20px;
-    }
-    .insight-box {
-        background-color: #e8f4fd;
-        border-left: 5px solid #1f77b4;
-        padding: 15px;
-        margin: 10px 0;
-        border-radius: 5px;
-    }
-    .warning-box {
-        background-color: #fff3cd;
-        border-left: 5px solid #ffc107;
-        padding: 15px;
-        margin: 10px 0;
-        border-radius: 5px;
-    }
-    .success-box {
-        background-color: #d1e7dd;
-        border-left: 5px solid #198754;
-        padding: 15px;
-        margin: 10px 0;
-        border-radius: 5px;
-    }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="RefLens Mobile — Fouls & Win Probability", layout="wide")
+st.markdown(
+    """
+    <style>
+    /* Mobile-first: tighten paddings, nicer fonts */
+    .block-container { padding-top: 1rem; padding-bottom: 2rem; }
+    h1,h2,h3 { font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial; }
+    .small { font-size: 0.9rem; opacity: 0.85; }
+    .tag { display:inline-block; padding:2px 8px; border-radius:14px; font-size:0.75rem;
+           background:#111; color:#eee; margin-right:6px; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:0.75rem; margin-right:6px; }
+    .badge.warn { background:#ffe8e8; color:#a00; border:1px solid #f5bcbc; }
+    .badge.ok { background:#e9f7ef; color:#0a8; border:1px solid #b8ead3; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-st.title("🏀 RefLens Pro - Advanced NBA Game Analytics")
-st.markdown("*Comprehensive game analysis with win probability, officiating insights, and performance metrics*")
+st.title("RefLens Mobile — Fouls & Win Probability")
 
-# Sidebar
-with st.sidebar:
-    st.header("Game Selection")
-    game_id = st.text_input(
-        "Enter NBA Game ID",
-        value="0022300001",
-        help="Format: 00223xxxxx for 2023-24 season"
+with st.expander("About this build", expanded=False):
+    st.markdown(
+        "- Free data via `nba_api` (play-by-play + box scores)\n"
+        "- Mobile-friendly win-probability timeline with foul markers\n"
+        "- ΔWP around each foul (next − current) as quick on-the-fly impact\n"
+        "- Detects **bonus** and **player foul trouble** (2-in-Q1, 3-by-halftime, 5-in-Q4)\n"
+        "- Works for **regular season & playoffs** (pick any date & game)\n"
+        "- Designed for copy-paste: single file, defensive error handling\n"
     )
-    
-    st.info("**Game ID Examples:**\n- Regular Season: 0022300001\n- Playoffs: 0042300101")
-    
-    btn_fetch = st.button("🔍 Analyze Game", type="primary", use_container_width=True)
-    
-    st.header("Analysis Options")
-    show_advanced_metrics = st.checkbox("Show Advanced Metrics", value=True)
-    show_momentum_analysis = st.checkbox("Show Momentum Analysis", value=True)
-    show_officiating_insights = st.checkbox("Show Officiating Insights", value=True)
 
-# Constants
-TOTAL_REG_SECS = 48 * 60
+# ----------------------------
+# Helpers
+# ----------------------------
 
-def parse_period_clock_to_secs_left(period: int, pctimestr: str) -> int:
-    """Convert period + 'MM:SS' into game seconds remaining."""
+def safe_int(x) -> int:
     try:
-        mm, ss = pctimestr.split(":")
-        p_secs_left = int(mm) * 60 + int(ss)
-    except:
-        p_secs_left = 0
-    
+        return int(x)
+    except Exception:
+        return 0
+
+def period_time_to_elapsed_seconds(period: int, pctimestring: str) -> int:
+    """
+    Convert 'MM:SS' (PC_TIME) + period -> absolute elapsed game seconds from tip.
+    NBA regulation: 12-minute quarters. OT periods are 5 minutes each.
+    """
+    try:
+        mm, ss = pctimestring.split(":")
+        remaining = int(mm) * 60 + int(ss)
+    except Exception:
+        remaining = 0
     if period <= 4:
-        base_before_period = TOTAL_REG_SECS - (period - 1) * 12 * 60
-        total_secs = max(0, p_secs_left + (base_before_period - 12 * 60))
-    else:  # Overtime
-        ot_periods = period - 4
-        total_secs = p_secs_left - (ot_periods * 5 * 60)
-    
-    return max(0, total_secs)
+        period_len = 12 * 60
+        prior = (period - 1) * period_len
+        elapsed_in_period = period_len - remaining
+        return prior + elapsed_in_period
+    else:
+        # Overtime: 5 minutes each
+        ot_len = 5 * 60
+        prior_reg = 4 * 12 * 60
+        prior_ot = (period - 5) * ot_len
+        elapsed_in_period = ot_len - remaining
+        return prior_reg + prior_ot + elapsed_in_period
 
-def enhanced_wp_model(score_margin: float, sec_remaining: float, period: int = 1) -> float:
-    """Enhanced win probability model."""
-    time_factor = max(0, sec_remaining / TOTAL_REG_SECS)
-    
-    margin_coeff = 0.18 if period <= 4 else 0.22
-    time_coeff = -0.0035 if sec_remaining > 300 else -0.008
-    
-    if sec_remaining < 120:
-        margin_coeff *= 1.3
-    if sec_remaining < 30:
-        margin_coeff *= 1.8
-        
-    z = margin_coeff * score_margin + time_coeff * sec_remaining
-    wp = 1.0 / (1.0 + np.exp(-z))
-    
-    return max(0.001, min(0.999, wp))
+def total_game_seconds(max_period: int) -> int:
+    if max_period <= 4:
+        return 4 * 12 * 60
+    else:
+        extra = (max_period - 4) * 5 * 60
+        return 4 * 12 * 60 + extra
 
-def detect_enhanced_fouls(row: pd.Series) -> tuple:
-    """Enhanced foul detection with severity scoring."""
-    text = " ".join(
-        str(x) for x in [
-            row.get("HOMEDESCRIPTION",""),
-            row.get("VISITORDESCRIPTION",""),
-            row.get("NEUTRALDESCRIPTION","")
-        ] if pd.notna(x)
-    ).upper()
-    
-    is_foul = "FOUL" in text
-    foul_type = ""
-    severity = 0.0
-    
-    if is_foul:
-        if "FLAGRANT" in text:
-            foul_type = "FLAGRANT"
-            severity = 3.0
-        elif "TECHNICAL" in text or "TECH" in text:
-            foul_type = "TECHNICAL"
-            severity = 2.5
-        elif "SHOOTING" in text or "S.FOUL" in text:
-            foul_type = "SHOOTING"
-            severity = 2.0
-        elif "OFFENSIVE" in text:
-            foul_type = "OFFENSIVE"
-            severity = 1.5
-        elif "LOOSE BALL" in text:
-            foul_type = "LOOSE BALL"
-            severity = 1.3
-        else:
-            foul_type = "PERSONAL"
-            severity = 1.0
-            
-    return is_foul, foul_type, severity
+# Baseline Win Probability model (transparent, stable)
+def baseline_wp(home_score: int, away_score: int, elapsed_s: int, total_s: int) -> float:
+    """
+    Simple logistic WP model:
+    features: lead = home - away, time factor = sqrt(time remaining ratio)
+    wp = 1/(1+exp(-(a + b*lead + c*lead*sqrt(remfrac))))
+    Coefficients below tuned to be reasonable for NBA pace without overfitting.
+    """
+    lead = home_score - away_score
+    remfrac = max(0.0, (total_s - elapsed_s) / max(1.0, total_s))
+    x = 0.08 * lead + 1.25 * lead * math.sqrt(remfrac)
+    # center: toss-up when x = 0
+    wp = 1.0 / (1.0 + math.exp(-x))
+    return float(np.clip(wp, 0.001, 0.999))
 
-def calculate_momentum_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate momentum and game flow metrics."""
-    df = df.copy()
-    
-    window = 10
-    df['margin_ma'] = df['score_margin'].rolling(window=window, min_periods=1).mean()
-    df['wp_ma'] = df['wp_home'].rolling(window=window, min_periods=1).mean()
-    
-    df['wp_change'] = df['wp_home'].diff().fillna(0)
-    df['momentum_shift'] = (abs(df['wp_change']) > 0.05).astype(int)
-    
-    df['wp_volatility'] = df['wp_home'].rolling(window=20, min_periods=5).std().fillna(0)
-    
+@dataclass
+class FoulEvent:
+    idx: int
+    period: int
+    pc_time: str
+    elapsed_s: int
+    team: str
+    player: Optional[str]
+    foul_type: str
+    committing_player_id: Optional[int]
+    team_id: Optional[int]
+    is_shooting: bool
+    team_in_bonus: bool
+    home_wp_before: float
+    home_wp_after: float
+    delta_wp_home: float  # after - before from home POV
+
+# ----------------------------
+# Data fetch
+# ----------------------------
+
+@st.cache_data(show_spinner=False, ttl=60*10)
+def get_games_for_date(game_date_str: str) -> pd.DataFrame:
+    """
+    Returns ScoreboardV2 for a date (YYYY-MM-DD). Includes regular + playoffs if on that date.
+    """
+    # NBA expects MM/DD/YYYY
+    month, day, year = game_date_str[5:7], game_date_str[8:10], game_date_str[0:4]
+    req_date = f"{month}/{day}/{year}"
+    sb = ScoreboardV2(game_date=req_date, day_offset=DayOffset.default)
+    games = sb.game_header.get_data_frame()
+    return games
+
+@st.cache_data(show_spinner=False, ttl=60*30)
+def get_pbp(game_id: str) -> pd.DataFrame:
+    pbp = PlayByPlayV2(game_id=game_id, timeout=30)
+    df = pbp.get_data_frames()[0].copy()
     return df
 
-def _clock_to_mmss(clock_val) -> str:
-    """Convert various clock formats to MM:SS."""
-    if not clock_val:
-        return "00:00"
-    s = str(clock_val)
-    
-    m = re.match(r"^PT(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$", s)
-    if m:
-        mm = int(m.group(1) or 0)
-        ss = float(m.group(2) or 0.0)
-        return f"{mm:02d}:{int(round(ss)):02d}"
-    
-    if re.match(r"^\d{1,2}:\d{2}$", s):
-        return s
-    if re.match(r"^\d{1,2}:\d{2}\.\d+$", s):
-        return s.split(".")[0]
-    
-    return "00:00"
+@st.cache_data(show_spinner=False, ttl=60*30)
+def get_boxscore(game_id: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    bs = BoxScoreTraditionalV2(game_id=game_id, timeout=30)
+    team_df = bs.team_stats.get_data_frame().copy()
+    player_df = bs.player_stats.get_data_frame().copy()
+    return team_df, player_df
 
-@st.cache_data(show_spinner=False, ttl=300)
-def load_enhanced_game_data(game_id: str):
-    """Load and process game data with enhanced analytics."""
-    url = f"https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_{game_id}.json"
+# ----------------------------
+# Parsing & metrics
+# ----------------------------
 
-    last_err = None
-    data = None
-    for i in range(3):
-        try:
-            r = requests.get(url, timeout=20)
-            if r.status_code == 200:
-                data = r.json()
-                break
-            last_err = RuntimeError(f"HTTP {r.status_code}")
-        except Exception as e:
-            last_err = e
-        time.sleep(1.0 * (i + 1))
-    
-    if data is None:
-        raise ValueError(f"Failed to fetch game data: {last_err}")
+def enrich_pbp_with_scores_wp(pbp: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build cumulative scores & WP across events; also detect bonus and player fouls.
+    """
+    df = pbp.copy()
+    # Ensure needed columns exist
+    needed = ["PERIOD", "PCTIMESTRING", "HOMEDESCRIPTION", "VISITORDESCRIPTION",
+              "SCORE", "SCOREMARGIN", "EVENTMSGTYPE", "PLAYER1_TEAM_ABBREVIATION",
+              "PLAYER1_NAME", "PLAYER1_ID", "PLAYER1_TEAM_ID"]
+    for c in needed:
+        if c not in df.columns:
+            df[c] = None
 
-    game = data.get("game", {})
-    actions = game.get("actions", [])
-    
-    if not actions:
-        raise ValueError("No play-by-play data found for this game ID.")
+    # Fill score columns
+    home_score = []
+    away_score = []
+    h, a = 0, 0
+    for s in df["SCORE"].fillna(""):
+        if isinstance(s, str) and "-" in s:
+            try:
+                parts = s.split("-")
+                a = safe_int(parts[0])
+                h = safe_int(parts[1])
+            except Exception:
+                pass
+        home_score.append(h)
+        away_score.append(a)
+    df["HOME_SCORE"] = home_score
+    df["AWAY_SCORE"] = away_score
 
-    home = game.get("homeTeam", {})
-    away = game.get("awayTeam", {})
-    
-    meta = {
-        "home_tricode": home.get("teamTricode", ""),
-        "home_city": home.get("teamCity", ""),
-        "home_name": home.get("teamName", ""),
-        "away_tricode": away.get("teamTricode", ""),
-        "away_city": away.get("teamCity", ""),
-        "away_name": away.get("teamName", ""),
-        "game_time_utc": game.get("gameTimeUTC", ""),
-    }
-    
-    game_date = ""
-    try:
-        if meta["game_time_utc"]:
-            dt = datetime.fromisoformat(meta["game_time_utc"].replace("Z","+00:00"))
-            game_date = dt.strftime("%B %d, %Y")
-    except:
-        pass
-    meta["game_date"] = game_date
+    # Elapsed + total seconds
+    df["ELAPSED_S"] = [period_time_to_elapsed_seconds(int(p), t if isinstance(t, str) else "00:00")
+                       for p, t in zip(df["PERIOD"].fillna(1), df["PCTIMESTRING"].fillna("00:00"))]
+    max_period = int(df["PERIOD"].max() or 4)
+    total_s = total_game_seconds(max_period)
+    df["TOTAL_S"] = total_s
 
-    rows = []
-    for i, action in enumerate(actions):
-        period = int(action.get("period", 1))
-        pctimestr = _clock_to_mmss(action.get("clock"))
-        
-        sh = action.get("scoreHome")
-        sa = action.get("scoreAway")
-        
-        try:
-            sh = int(sh) if sh is not None else None
-            sa = int(sa) if sa is not None else None
-        except:
-            sh = sa = None
+    # Compute baseline WP (home POV)
+    df["HOME_WP"] = [baseline_wp(hh, aa, es, total_s) for hh, aa, es in zip(df["HOME_SCORE"], df["AWAY_SCORE"], df["ELAPSED_S"])]
 
-        rows.append({
-            "GAME_ID": str(game_id),
-            "EVENTNUM": int(action.get("actionNumber", i)),
-            "PERIOD": period,
-            "PCTIMESTRING": pctimestr,
-            "SCORE": f"{sh} - {sa}" if sh is not None and sa is not None else None,
-            "HOMEDESCRIPTION": None,
-            "VISITORDESCRIPTION": None,
-            "NEUTRALDESCRIPTION": action.get("description", ""),
-            "home_score": sh,
-            "away_score": sa,
-        })
+    # Track team fouls per quarter to mark bonus
+    df["EVENTMSGTYPE"] = df["EVENTMSGTYPE"].fillna(0).astype(int)
+    is_foul = df["EVENTMSGTYPE"] == 6
 
-    df = pd.DataFrame(rows).sort_values(["PERIOD", "EVENTNUM"]).reset_index(drop=True)
-    
-    df["sec_remaining"] = df.apply(
-        lambda r: parse_period_clock_to_secs_left(r["PERIOD"], r["PCTIMESTRING"]), axis=1
-    )
-    
-    df["home_score"] = df["home_score"].ffill()
-    df["away_score"] = df["away_score"].ffill()
-    df["score_margin"] = df["home_score"] - df["away_score"]
-    
-    foul_data = df.apply(detect_enhanced_fouls, axis=1, result_type="expand")
-    df["is_foul"] = foul_data[0]
-    df["foul_type"] = foul_data[1]
-    df["foul_severity"] = foul_data[2]
-    
-    mask = df["home_score"].notna() & df["away_score"].notna()
-    df["wp_home"] = np.nan
-    
-    for idx in df[mask].index:
-        row = df.loc[idx]
-        wp = enhanced_wp_model(
-            row["score_margin"], 
-            row["sec_remaining"], 
-            row["PERIOD"]
-        )
-        df.loc[idx, "wp_home"] = wp
-    
-    df["wp_next"] = df["wp_home"].shift(-1)
-    df["wp_change"] = df["wp_home"].diff().fillna(0)
-    df["dwp_obs"] = df["wp_next"] - df["wp_home"]
-    
-    df = calculate_momentum_metrics(df)
-    
-    return df, meta
+    # team abbrev from PLAYER1_TEAM_ABBREVIATION if available, else parse description
+    def infer_team(row) -> str:
+        t = row.get("PLAYER1_TEAM_ABBREVIATION")
+        if isinstance(t, str) and t.strip():
+            return t
+        hdesc = row.get("HOMEDESCRIPTION") or ""
+        vdesc = row.get("VISITORDESCRIPTION") or ""
+        # crude: if foul text only in one side, map to that side
+        if "FOUL" in hdesc.upper() and not "FOUL" in vdesc.upper():
+            return "HOME"
+        if "FOUL" in vdesc.upper() and not "FOUL" in hdesc.upper():
+            return "AWAY"
+        return "UNK"
 
-def create_wp_chart(df: pd.DataFrame, meta: dict):
-    """Create win probability chart."""
-    chart_data = df[df["wp_home"].notna()].copy()
-    
-    if PLOTLY_AVAILABLE:
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=chart_data.index,
-            y=chart_data["wp_home"] * 100,
-            mode='lines',
-            name='Home Win %',
-            line=dict(color='#1f77b4', width=2)
-        ))
-        
-        momentum_shifts = chart_data[chart_data["momentum_shift"] == 1]
-        if not momentum_shifts.empty:
-            fig.add_trace(go.Scatter(
-                x=momentum_shifts.index,
-                y=momentum_shifts["wp_home"] * 100,
-                mode='markers',
-                name='Momentum Shifts',
-                marker=dict(color='red', size=8, symbol='diamond')
-            ))
-        
-        fouls = chart_data[chart_data["is_foul"]]
-        if not fouls.empty:
-            fig.add_trace(go.Scatter(
-                x=fouls.index,
-                y=fouls["wp_home"] * 100,
-                mode='markers',
-                name='Fouls',
-                marker=dict(color='orange', size=6, symbol='x')
-            ))
-        
-        fig.update_layout(
-            title=f"Win Probability - {meta.get('away_tricode', 'Away')} @ {meta.get('home_tricode', 'Home')}",
-            xaxis_title="Game Events",
-            yaxis_title="Home Team Win Probability (%)",
-            height=500,
-            showlegend=True
-        )
-        
-        fig.update_yaxis(range=[0, 100])
-        return fig
-    else:
-        chart_df = chart_data[["wp_home"]].copy()
-        chart_df["wp_home"] = chart_df["wp_home"] * 100
-        chart_df = chart_df.rename(columns={"wp_home": "Home Win %"})
-        return chart_df
+    df["FOUL_TEAM"] = [infer_team(r) for _, r in df.iterrows()]
 
-def analyze_officiating_impact(df: pd.DataFrame) -> dict:
-    """Comprehensive officiating impact analysis."""
-    fouls = df[df["is_foul"] & df["wp_home"].notna()].copy()
-    
-    if fouls.empty:
-        return {"error": "No foul data available for analysis"}
-    
-    total_fouls = len(fouls)
-    fouls_toward_home = (fouls["dwp_obs"] > 0).sum()
-    fouls_toward_away = (fouls["dwp_obs"] < 0).sum()
-    
-    pct_toward_home = (fouls_toward_home / total_fouls) * 100
-    
-    total_wp_impact = fouls["dwp_obs"].sum()
-    avg_wp_impact = fouls["dwp_obs"].mean()
-    
-    clutch_fouls = fouls[fouls["sec_remaining"] <= 300]
-    clutch_impact = clutch_fouls["dwp_obs"].sum() if not clutch_fouls.empty else 0
-    
-    severity_impact = {}
-    for foul_type in fouls["foul_type"].unique():
-        if foul_type:
-            type_fouls = fouls[fouls["foul_type"] == foul_type]
-            severity_impact[foul_type] = {
-                "count": len(type_fouls),
-                "avg_impact": type_fouls["dwp_obs"].mean(),
-                "total_impact": type_fouls["dwp_obs"].sum()
-            }
-    
-    try:
-        from scipy import stats
-        if len(fouls) > 10:
-            t_stat, p_value = stats.ttest_1samp(fouls["dwp_obs"], 0)
-            statistically_significant = p_value < 0.05
-        else:
-            statistically_significant = False
-            p_value = None
-    except ImportError:
-        if len(fouls) > 10:
-            mean_impact = fouls["dwp_obs"].mean()
-            std_impact = fouls["dwp_obs"].std()
-            statistically_significant = abs(mean_impact) > 2 * (std_impact / np.sqrt(len(fouls)))
-            p_value = None
-        else:
-            statistically_significant = False
-            p_value = None
-    
-    return {
-        "total_fouls": total_fouls,
-        "fouls_toward_home": fouls_toward_home,
-        "fouls_toward_away": fouls_toward_away,
-        "pct_toward_home": pct_toward_home,
-        "total_wp_impact": total_wp_impact,
-        "avg_wp_impact": avg_wp_impact,
-        "clutch_fouls": len(clutch_fouls),
-        "clutch_impact": clutch_impact,
-        "severity_impact": severity_impact,
-        "statistically_significant": statistically_significant,
-        "p_value": p_value
-    }
+    # Count team fouls per period
+    df["HOME_TEAM_FOULS_P"] = 0
+    df["AWAY_TEAM_FOULS_P"] = 0
+    df["HOME_IN_BONUS"] = False
+    df["AWAY_IN_BONUS"] = False
 
-def generate_game_insights(df: pd.DataFrame, meta: dict, officiating_analysis: dict) -> list:
-    """Generate actionable insights from the game data."""
-    insights = []
-    
-    if df["wp_home"].notna().any():
-        final_wp = df["wp_home"].iloc[-1]
-        max_wp = df["wp_home"].max()
-        min_wp = df["wp_home"].min()
-        
-        if max_wp - min_wp > 0.6:
-            insights.append({
-                "type": "info",
-                "title": "High Volatility Game",
-                "message": f"This game featured significant momentum swings with win probability ranging from {min_wp*100:.1f}% to {max_wp*100:.1f}%."
-            })
-        
-        close_game_time = (df["wp_home"] > 0.4) & (df["wp_home"] < 0.6)
-        close_game_duration = close_game_time.sum()
-        
-        if close_game_duration > len(df) * 0.3:
-            insights.append({
-                "type": "success",
-                "title": "Competitive Game",
-                "message": f"The game remained competitive for {close_game_duration/len(df)*100:.1f}% of the events."
-            })
-    
-    if "error" not in officiating_analysis:
-        pct_home = officiating_analysis["pct_toward_home"]
-        total_impact = officiating_analysis["total_wp_impact"]
-        
-        if abs(pct_home - 50) > 15:
-            direction = "home" if pct_home > 50 else "away"
-            insights.append({
-                "type": "warning",
-                "title": "Officiating Imbalance Detected",
-                "message": f"{pct_home:.1f}% of foul calls favored the {direction} team, with a total impact of {total_impact:+.3f} WP points."
-            })
-        
-        if officiating_analysis["clutch_impact"] != 0:
-            insights.append({
-                "type": "info",
-                "title": "Clutch Time Officiating Impact",
-                "message": f"Foul calls in the final 5 minutes had a combined impact of {officiating_analysis['clutch_impact']:+.3f} WP points."
-            })
-    
-    return insights
+    home_fouls = {}
+    away_fouls = {}
 
-# Main Application
-if btn_fetch:
-    with st.spinner("🔍 Fetching and analyzing game data..."):
-        try:
-            df, meta = load_enhanced_game_data(game_id)
-        except Exception as e:
-            st.error(f"❌ Failed to load game data: {str(e)}")
-            st.stop()
-    
-    # Game Header
-    home_team = f"{meta.get('home_city', '')} {meta.get('home_name', '')} ({meta.get('home_tricode', '')})"
-    away_team = f"{meta.get('away_city', '')} {meta.get('away_name', '')} ({meta.get('away_tricode', '')})"
-    game_date = meta.get('game_date', 'Unknown Date')
-    
-    final_home_score = df['home_score'].iloc[-1] if not df['home_score'].isna().all() else 0
-    final_away_score = df['away_score'].iloc[-1] if not df['away_score'].isna().all() else 0
-    
-    st.markdown(f"""
-    <div class="game-header">
-        <h2>🏀 {away_team} @ {home_team}</h2>
-        <h3>📅 {game_date} | Final Score: {final_away_score} - {final_home_score}</h3>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Main content in tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Win Probability", "⚡ Game Analytics", "🔍 Officiating Analysis", "💡 Insights"])
-    
-    with tab1:
-        st.subheader("Win Probability Analysis")
-        
-        wp_chart = create_wp_chart(df, meta)
-        if PLOTLY_AVAILABLE:
-            st.plotly_chart(wp_chart, use_container_width=True)
-        else:
-            st.subheader(f"Win Probability Timeline - {meta.get('away_tricode', 'Away')} @ {meta.get('home_tricode', 'Home')}")
-            st.line_chart(wp_chart, height=500)
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            if not df["wp_home"].isna().all():
-                final_wp = df["wp_home"].iloc[-1]
-                st.metric("Final Home Win Prob", f"{final_wp*100:.1f}%")
-        
-        with col2:
-            if not df["wp_home"].isna().all():
-                max_wp = df["wp_home"].max()
-                st.metric("Peak Home Win Prob", f"{max_wp*100:.1f}%")
-        
-        with col3:
-            if not df["wp_home"].isna().all():
-                min_wp = df["wp_home"].min()
-                st.metric("Lowest Home Win Prob", f"{min_wp*100:.1f}%")
-        
-        with col4:
-            if "wp_volatility" in df.columns:
-                volatility = df["wp_volatility"].mean()
-                st.metric("Average Volatility", f"{volatility:.3f}")
-    
-    with tab2:
-        if show_advanced_metrics or show_momentum_analysis:
-            st.subheader("Advanced Game Analytics")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                if show_momentum_analysis:
-                    st.write("**Momentum Analysis**")
-                    if "momentum_shift" in df.columns:
-                        momentum_shifts = (df["momentum_shift"] == 1).sum()
-                        st.metric("Major Momentum Shifts", momentum_shifts)
-                    
-                    if PLOTLY_AVAILABLE:
-                        fig_margin = go.Figure()
-                        fig_margin.add_trace(go.Scatter(
-                            x=df.index,
-                            y=df["score_margin"],
-                            mode='lines',
-                            name='Score Margin',
-                            line=dict(color='green', width=2)
-                        ))
-                        fig_margin.update_layout(
-                            title="Score Margin Over Time (Positive = Home Leading)",
-                            xaxis_title="Game Events",
-                            yaxis_title="Score Margin",
-                            height=400
-                        )
-                        st.plotly_chart(fig_margin, use_container_width=True)
-                    else:
-                        st.subheader("Score Margin Over Time")
-                        margin_chart = df[["score_margin"]].rename(columns={"score_margin": "Score Margin"})
-                        st.line_chart(margin_chart, height=400)
-            
-            with col2:
-                if show_advanced_metrics:
-                    st.write("**Game Flow Metrics**")
-                    
-                    lead_changes = ((df["score_margin"] > 0) != (df["score_margin"].shift(1) > 0)).sum()
-                    st.metric("Lead Changes", lead_changes)
-                    
-                    max_home_lead = df["score_margin"].max()
-                    max_away_lead = abs(df["score_margin"].min())
-                    st.metric("Largest Home Lead", f"+{max_home_lead}")
-                    st.metric("Largest Away Lead", f"+{max_away_lead}")
-    
-    with tab3:
-        if show_officiating_insights:
-            st.subheader("Officiating Impact Analysis")
-            
-            officiating_analysis = analyze_officiating_impact(df)
-            
-            if "error" not in officiating_analysis:
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric("Total Fouls", officiating_analysis["total_fouls"])
-                
-                with col2:
-                    st.metric("% Favoring Home", f"{officiating_analysis['pct_toward_home']:.1f}%")
-                
-                with col3:
-                    st.metric("Total WP Impact", f"{officiating_analysis['total_wp_impact']:+.3f}")
-                
-                with col4:
-                    st.metric("Clutch Time Fouls", officiating_analysis["clutch_fouls"])
-                
-                st.write("**Foul Impact by Type**")
-                
-                severity_data = []
-                for foul_type, data in officiating_analysis["severity_impact"].items():
-                    severity_data.append({
-                        "Foul Type": foul_type,
-                        "Count": data["count"],
-                        "Avg Impact": f"{data['avg_impact']:+.3f}",
-                        "Total Impact": f"{data['total_impact']:+.3f}"
-                    })
-                
-                if severity_data:
-                    st.dataframe(pd.DataFrame(severity_data), use_container_width=True, hide_index=True)
-                
-                if officiating_analysis.get("statistically_significant"):
-                    if officiating_analysis.get("p_value"):
-                        st.warning(f"⚠️ Officiating bias may be statistically significant (p={officiating_analysis['p_value']:.3f})")
-                    else:
-                        st.warning("⚠️ Officiating bias may be statistically significant")
-                else:
-                    st.info("ℹ️ No statistically significant officiating bias detected.")
-            
+    for i, row in df.iterrows():
+        p = int(row["PERIOD"]) if not pd.isna(row["PERIOD"]) else 1
+        if p not in home_fouls:
+            home_fouls[p] = 0
+        if p not in away_fouls:
+            away_fouls[p] = 0
+        if is_foul.iloc[i]:
+            team = row["FOUL_TEAM"]
+            if team == "HOME" or (isinstance(team, str) and team == row.get("HOMEDESCRIPTION", "")):
+                home_fouls[p] += 1
+            elif team == "AWAY":
+                away_fouls[p] += 1
             else:
-                st.warning("No officiating data available for analysis.")
-    
-    with tab4:
-        st.subheader("Game Insights & Analysis")
-        
-        insights = generate_game_insights(df, meta, analyze_officiating_impact(df))
-        
-        for insight in insights:
-            if insight["type"] == "info":
-                st.markdown(f"""
-                <div class="insight-box">
-                    <strong>{insight["title"]}</strong><br>
-                    {insight["message"]}
-                </div>
-                """, unsafe_allow_html=True)
-            elif insight["type"] == "warning":
-                st.markdown(f"""
-                <div class="warning-box">
-                    <strong>⚠️ {insight["title"]}</strong><br>
-                    {insight["message"]}
-                </div>
-                """, unsafe_allow_html=True)
-            elif insight["type"] == "success":
-                st.markdown(f"""
-                <div class="success-box">
-                    <strong>✅ {insight["title"]}</strong><br>
-                    {insight["message"]}
-                </div>
-                """, unsafe_allow_html=True)
-        
-        st.write("**Detailed Game Statistics**")
-        
-        total_events = len(df)
-        total_fouls = (df["is_foul"] == True).sum()
-        foul_rate = (total_fouls / total_events) * 100 if total_events > 0 else 0
-        
-        summary_cols = st.columns(3)
-        with summary_cols[0]:
-            st.metric("Total Events", total_events)
-        with summary_cols[1]:
-            st.metric("Total Fouls", total_fouls)
-        with summary_cols[2]:
-            st.metric("Foul Rate", f"{foul_rate:.1f}%")
+                # Try to infer via description side:
+                hdesc = (row["HOMEDESCRIPTION"] or "").upper()
+                vdesc = (row["VISITORDESCRIPTION"] or "").upper()
+                # If foul mentioned in home description:
+                if "FOUL" in hdesc and "FOUL" not in vdesc:
+                    home_fouls[p] += 1
+                elif "FOUL" in vdesc and "FOUL" not in hdesc:
+                    away_fouls[p] += 1
+                # else uncertain -> ignore count increment
 
+        df.at[i, "HOME_TEAM_FOULS_P"] = home_fouls[p]
+        df.at[i, "AWAY_TEAM_FOULS_P"] = away_fouls[p]
+        df.at[i, "HOME_IN_BONUS"] = home_fouls[p] >= 5
+        df.at[i, "AWAY_IN_BONUS"] = away_fouls[p] >= 5
+
+    # Player foul counts to detect "foul trouble"
+    df["FOUL_TYPE_TEXT"] = ""
+    df["FOUL_PLAYER"] = None
+    df["FOUL_PLAYER_ID"] = None
+    df["FOUL_IS_SHOOTING"] = False
+    df["FOUL_TROUBLE_FLAG"] = ""  # "2-in-Q1", "3-by-Half", "5-in-Q4", ""
+
+    player_pf: Dict[int, int] = {}
+    for i, row in df.iterrows():
+        if is_foul.iloc[i]:
+            # parse description strings
+            text = (row["HOMEDESCRIPTION"] or "") + " " + (row["VISITORDESCRIPTION"] or "")
+            up = text.upper()
+            foul_type = "FOUL"
+            if "SHOOTING" in up:
+                shoot = True
+                foul_type = "SHOOTING FOUL"
+            else:
+                shoot = False
+                # try basic extraction
+            df.at[i, "FOUL_TYPE_TEXT"] = foul_type
+
+            pid = row.get("PLAYER1_ID")
+            pname = row.get("PLAYER1_NAME")
+            if pd.notna(pid):
+                pid = int(pid)
+                pf_prev = player_pf.get(pid, 0)
+                pf_now = pf_prev + 1
+                player_pf[pid] = pf_now
+                df.at[i, "FOUL_PLAYER_ID"] = pid
+                df.at[i, "FOUL_PLAYER"] = pname
+
+                # foul trouble flags
+                period = int(row["PERIOD"] or 1)
+                elapsed = int(row["ELAPSED_S"] or 0)
+                half = 1 if period <= 2 else 2
+                flag = ""
+                if period == 1 and pf_now >= 2:
+                    flag = "2-in-Q1"
+                elif half == 1 and pf_now >= 3:
+                    flag = "3-by-Half"
+                elif period >= 4 and pf_now >= 5:
+                    flag = "5-in-Q4+"
+                df.at[i, "FOUL_TROUBLE_FLAG"] = flag
+
+            df.at[i, "FOUL_IS_SHOOTING"] = shoot
+
+    # ΔWP around fouls (after-next - current)
+    df["HOME_WP_NEXT"] = df["HOME_WP"].shift(-1).fillna(df["HOME_WP"])
+    df["FOUL_DELTA_WP_HOME"] = (df["HOME_WP_NEXT"] - df["HOME_WP"]).where(is_foul, 0.0)
+
+    return df
+
+def summarize_foul_events(df: pd.DataFrame, home_abbr: str, away_abbr: str) -> List[FoulEvent]:
+    events: List[FoulEvent] = []
+    for i, row in df.iterrows():
+        if int(row["EVENTMSGTYPE"]) == 6:
+            team = row.get("PLAYER1_TEAM_ABBREVIATION")
+            # If missing, infer by side of description
+            if not isinstance(team, str) or not team:
+                hdesc = (row["HOMEDESCRIPTION"] or "").upper()
+                vdesc = (row["VISITORDESCRIPTION"] or "").upper()
+                if "FOUL" in hdesc and "FOUL" not in vdesc:
+                    team = home_abbr
+                elif "FOUL" in vdesc and "FOUL" not in hdesc:
+                    team = away_abbr
+                else:
+                    team = "UNK"
+            events.append(
+                FoulEvent(
+                    idx=i,
+                    period=int(row["PERIOD"] or 1),
+                    pc_time=str(row["PCTIMESTRING"] or "00:00"),
+                    elapsed_s=int(row["ELAPSED_S"] or 0),
+                    team=team,
+                    player=row.get("FOUL_PLAYER"),
+                    foul_type=row.get("FOUL_TYPE_TEXT") or "FOUL",
+                    committing_player_id=row.get("FOUL_PLAYER_ID"),
+                    team_id=row.get("PLAYER1_TEAM_ID"),
+                    is_shooting=bool(row.get("FOUL_IS_SHOOTING")),
+                    team_in_bonus=bool(row["HOME_IN_BONUS"]) if team == home_abbr else bool(row["AWAY_IN_BONUS"]),
+                    home_wp_before=float(row["HOME_WP"]),
+                    home_wp_after=float(row["HOME_WP_NEXT"]),
+                    delta_wp_home=float(row["FOUL_DELTA_WP_HOME"]),
+                )
+            )
+    return events
+
+def build_game_selector(date_str: str):
+    games = get_games_for_date(date_str)
+    if games.empty:
+        st.warning("No NBA games found for this date.")
+        st.stop()
+
+    # Build nice labels
+    games["LABEL"] = games.apply(
+        lambda r: f"{r['VISITOR_TEAM_ABBREVIATION']} @ {r['HOME_TEAM_ABBREVIATION']} — {r['GAME_STATUS_TEXT']} — {r['GAME_ID']}",
+        axis=1,
+    )
+    idx = 0
+    game_label = st.selectbox("Select a game", games["LABEL"].tolist(), index=idx)
+    row = games[games["LABEL"] == game_label].iloc[0]
+    return row["GAME_ID"], row["HOME_TEAM_ABBREVIATION"], row["VISITOR_TEAM_ABBREVIATION"], row
+
+# ----------------------------
+# UI Controls
+# ----------------------------
+
+left, right = st.columns([1, 2], vertical_alignment="center")
+
+with left:
+    today_str = pd.Timestamp.today(tz="US/Pacific").strftime("%Y-%m-%d")
+    date_str = st.date_input("Game date", value=pd.to_datetime(today_str)).strftime("%Y-%m-%d")
+    st.caption("Includes regular season & playoffs on the chosen date.")
+    reload = st.button("🔁 Reload data (if a timeout occurred)")
+
+with right:
+    st.markdown(
+        "<div class='small'>Tip: On mobile, pinch-zoom the timeline; tap markers for foul details. "
+        "Toggle layers in the legend to declutter.</div>",
+        unsafe_allow_html=True,
+    )
+
+try:
+    game_id, home_abbr, away_abbr, game_row = build_game_selector(date_str)
+except Exception as e:
+    st.error(f"Failed to load games for {date_str}: {e}")
+    st.stop()
+
+if reload:
+    get_pbp.clear()
+    get_boxscore.clear()
+    enrich_pbp_with_scores_wp.clear()
+
+# ----------------------------
+# Fetch & compute
+# ----------------------------
+with st.spinner("Fetching play-by-play and computing metrics..."):
+    try:
+        pbp_raw = get_pbp(game_id)
+        team_df, player_df = get_boxscore(game_id)
+    except Exception as e:
+        st.error(f"Failed to load play-by-play: {e}")
+        st.stop()
+
+    if pbp_raw.empty:
+        st.warning("No play-by-play available yet for this game.")
+        st.stop()
+
+    pbp = enrich_pbp_with_scores_wp(pbp_raw)
+    fouls = summarize_foul_events(pbp, home_abbr, away_abbr)
+
+# ----------------------------
+# Top banner / summary
+# ----------------------------
+home_name = team_df.loc[team_df["TEAM_ABBREVIATION"] == home_abbr, "TEAM_NAME"].values
+away_name = team_df.loc[team_df["TEAM_ABBREVIATION"] == away_abbr, "TEAM_NAME"].values
+home_name = home_name[0] if len(home_name) else home_abbr
+away_name = away_name[0] if len(away_name) else away_abbr
+
+st.subheader(f"{away_abbr} @ {home_abbr}")
+st.markdown(
+    f"<span class='tag'>Game ID: {game_id}</span>"
+    f"<span class='tag'>{away_name} at {home_name}</span>",
+    unsafe_allow_html=True,
+)
+
+# Team foul counts by period
+periods = sorted(pbp["PERIOD"].dropna().unique().tolist())
+team_fouls_by_p = pd.DataFrame({
+    "PERIOD": periods,
+    f"{home_abbr}_FOULS": [int(pbp.loc[pbp["PERIOD"] == p, "HOME_TEAM_FOULS_P"].max()) for p in periods],
+    f"{away_abbr}_FOULS": [int(pbp.loc[pbp["PERIOD"] == p, "AWAY_TEAM_FOULS_P"].max()) for p in periods],
+})
+home_bonus_periods = [p for p in periods if (pbp.loc[pbp["PERIOD"] == p, "HOME_IN_BONUS"]).any()]
+away_bonus_periods = [p for p in periods if (pbp.loc[pbp["PERIOD"] == p, "AWAY_IN_BONUS"]).any()]
+
+# ----------------------------
+# Main chart: Win probability + foul markers + bonus shading
+# ----------------------------
+with st.spinner("Rendering timeline..."):
+    fig = make_subplots(rows=1, cols=1, shared_xaxes=True)
+
+    # Win prob (home)
+    x = pbp["ELAPSED_S"]
+    total_s = int(pbp["TOTAL_S"].iloc[-1])
+    # Format x ticks as Q1..OT with mm:ss
+    def fmt_xticks(seconds: List[int]) -> List[str]:
+        labels = []
+        for s in seconds:
+            # map back to period/time
+            # find closest row
+            idx = int(np.argmin(np.abs(pbp["ELAPSED_S"].values - s)))
+            period = int(pbp["PERIOD"].iloc[idx])
+            t = str(pbp["PCTIMESTRING"].iloc[idx])
+            labels.append(f"Q{period} {t}" if period <= 4 else f"OT{period-4} {t}")
+        return labels
+
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=pbp["HOME_WP"],
+            mode="lines",
+            name=f"WP — {home_abbr} (home)",
+            hovertemplate="t=%{x:.0f}s • WP=%{y:.1%}<extra></extra>",
+        ),
+        row=1, col=1
+    )
+
+    # Lead tracker (secondary y, lightly)
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=(pbp["HOME_SCORE"] - pbp["AWAY_SCORE"]),
+            mode="lines",
+            name="Score lead (home)",
+            yaxis="y2",
+            opacity=0.35,
+            hovertemplate="t=%{x:.0f}s • Lead=%{y}<extra></extra>",
+        ),
+        row=1, col=1
+    )
+
+    # Bonus shading per period
+    for p in periods:
+        # Shade when either side is in bonus for that period
+        mask = pbp["PERIOD"] == p
+        if mask.any():
+            xs = pbp.loc[mask, "ELAPSED_S"].values
+            hb = pbp.loc[mask, "HOME_IN_BONUS"].values
+            ab = pbp.loc[mask, "AWAY_IN_BONUS"].values
+            # If many points, compress into contiguous spans
+            def spans(arr, xarr):
+                spans_ = []
+                on = False
+                start = None
+                for k in range(len(arr)):
+                    if arr[k] and not on:
+                        on = True; start = xarr[k]
+                    if on and (k == len(arr)-1 or not arr[k+1]):
+                        end = xarr[k]
+                        spans_.append((start, end))
+                        on = False
+                return spans_
+
+            for s, e in spans(hb, xs):
+                fig.add_vrect(x0=s, x1=e, line_width=0, fillcolor="rgba(255,0,0,0.05)", layer="below", annotation_text=f"{home_abbr} bonus", annotation_position="top left")
+            for s, e in spans(ab, xs):
+                fig.add_vrect(x0=s, x1=e, line_width=0, fillcolor="rgba(0,0,255,0.05)", layer="below", annotation_text=f"{away_abbr} bonus", annotation_position="bottom left")
+
+    # Foul markers
+    foul_df = pbp[pbp["EVENTMSGTYPE"] == 6].copy()
+    if not foul_df.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=foul_df["ELAPSED_S"],
+                y=foul_df["HOME_WP"],
+                mode="markers",
+                name="Fouls",
+                marker=dict(size=9, symbol="x"),
+                hovertemplate=(
+                    "Q%{customdata[0]} %{customdata[1]}<br>"
+                    "%{customdata[2]}<br>"
+                    "ΔWP(h): %{customdata[3]:+.2%}<extra></extra>"
+                ),
+                customdata=np.stack([
+                    foul_df["PERIOD"].values,
+                    foul_df["PCTIMESTRING"].values,
+                    foul_df["FOUL_TYPE_TEXT"].fillna("FOUL").values,
+                    foul_df["FOUL_DELTA_WP_HOME"].values
+                ], axis=1)
+            ),
+            row=1, col=1
+        )
+
+    fig.update_layout(
+        height=520,
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h", y=-0.15),
+        xaxis=dict(title="Elapsed (s)", rangemode="tozero"),
+        yaxis=dict(title=f"Home WP ({home_abbr})", tickformat=".0%"),
+        yaxis2=dict(overlaying="y", side="right", title="Home Lead", showgrid=False),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+# ----------------------------
+# Foul Impact Tables
+# ----------------------------
+st.markdown("### Foul impact (ΔWP)")
+
+if len(fouls) == 0:
+    st.info("No fouls recorded in this game (yet).")
 else:
-    st.markdown("""
-    ## 🚀 Welcome to RefLens Pro
-    
-    **Advanced NBA Game Analytics Platform**
-    
-    ### What You'll Get:
-    
-    **📊 Comprehensive Win Probability Analysis**
-    - Enhanced WP model accounting for game situation
-    - Momentum shift detection
-    - Visual timeline with key events highlighted
-    
-    **⚡ Advanced Game Analytics**
-    - Score margin analysis
-    - Lead change tracking
-    - Game flow volatility metrics
-    - Momentum analysis
-    
-    **🔍 Officiating Impact Assessment**  
-    - Foul impact quantification
-    - Statistical significance testing
-    - Clutch time officiating analysis
-    - Bias detection algorithms
-    
-    **💡 Actionable Insights**
-    - AI-generated game insights
-    - Performance patterns identification
-    - Strategic recommendations
-    
-    ### How to Use:
-    1. Enter an NBA Game ID in the sidebar (format: 00223xxxxx for 2023-24 season)
-    2. Click "Analyze Game" to fetch data
-    3. Explore different analysis tabs
-    4. Customize analysis options in sidebar
-    
-    ### Sample Game IDs to Try:
-    - **0022300001** - Season opener 2023-24
-    - **0022300500** - Mid-season game
-    - **0042300101** - Playoff game (if available)
-    
-    ---
-    
-    **Built with advanced statistical models and real NBA data from official sources.*
-    """)
-    
-    with st.expander("🔧 Advanced Features", expanded=False):
-        st.markdown("""
-        ### Statistical Models Used:
-        
-        **Enhanced Win Probability Model:**
-        - Accounts for game situation (regular vs overtime)
-        - Increased volatility in final minutes
-        - Historical NBA data calibration
-        
-        **Momentum Detection:**
-        - Rolling averages for trend identification  
-        - Volatility-based momentum shift detection
-        - Statistical significance testing
-        
-        **Officiating Impact Analysis:**
-        - Foul severity scoring system
-        - Timing-based impact weighting
-        - Bias detection with confidence intervals
-        """)
-    
-    with st.expander("📖 Understanding the Metrics", expanded=False):
-        st.markdown("""
-        ### Win Probability Metrics:
-        
-        **Win Probability (WP):** Likelihood of home team winning based on current game state
-        
-        **ΔWP (Delta Win Probability):** Change in win probability from one event to the next
-        
-        **Momentum Shift:** Significant WP change (>5%) indicating game momentum change
-        
-        **Volatility:** Standard deviation of WP over rolling window - higher = more unpredictable
-        
-        ### Officiating Metrics:
-        
-        **% Favoring Home/Away:** Percentage of foul calls that increased respective team's win probability
-        
-        **Total WP Impact:** Sum of all ΔWP from foul calls (positive = favors home)
-        
-        **Clutch Time Impact:** WP impact of fouls in final 5 minutes (most critical)
-        
-        **Statistical Significance:** Whether officiating bias exceeds random chance (p < 0.05)
-        
-        ### Foul Severity Scoring:
-        - **Personal Foul:** 1.0 (baseline)
-        - **Loose Ball:** 1.3 
-        - **Offensive:** 1.5
-        - **Shooting:** 2.0
-        - **Technical:** 2.5
-        - **Flagrant:** 3.0 (most severe)
-        """)
+    f_df = pd.DataFrame([{
+        "Q": f.period,
+        "Time": f.pc_time,
+        "Team": f.team,
+        "Player": f.player,
+        "Type": ("Shooting " if f.is_shooting else "") + (f.foul_type or "Foul"),
+        "In Bonus": f.team_in_bonus,
+        "Home WP (before)": f.home_wp_before,
+        "Home WP (after)": f.home_wp_after,
+        "ΔWP (home)": f.delta_wp_home
+    } for f in fouls])
 
-# Footer
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: gray; font-size: 0.8em;'>
-    <p>RefLens Pro v2.0 | Advanced NBA Analytics Platform</p>
-    <p>Data sourced from official NBA API | Analysis updated in real-time</p>
-    <p>🏀 Built for basketball analytics enthusiasts and professionals</p>
-</div>
-""", unsafe_allow_html=True)
+    # Sort by absolute swing
+    top_swings = f_df.reindex(f_df["ΔWP (home)"].abs().sort_values(ascending=False).index).head(12)
+    st.dataframe(
+        top_swings.style.format({
+            "Home WP (before)": "{:.1%}",
+            "Home WP (after)": "{:.1%}",
+            "ΔWP (home)": "{:+.2%}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# ----------------------------
+# Player Foul Trouble Panel
+# ----------------------------
+st.markdown("### Player foul trouble")
+
+ft = pbp[pbp["FOUL_TROUBLE_FLAG"] != ""]
+if ft.empty:
+    st.caption("No classic foul-trouble thresholds triggered (2-in-Q1, 3-by-Half, 5-in-Q4+).")
+else:
+    ft_small = ft[["PERIOD","PCTIMESTRING","FOUL_PLAYER","PLAYER1_TEAM_ABBREVIATION","FOUL_TROUBLE_FLAG","HOME_WP"]].copy()
+    ft_small.rename(columns={
+        "PERIOD":"Q", "PCTIMESTRING":"Time", "FOUL_PLAYER":"Player", "PLAYER1_TEAM_ABBREVIATION":"Team",
+        "FOUL_TROUBLE_FLAG":"Flag", "HOME_WP":"Home WP"
+    }, inplace=True)
+    st.dataframe(
+        ft_small.style.format({"Home WP":"{:.1%}"}),
+        use_container_width=True,
+        hide_index=True
+    )
+
+# ----------------------------
+# Per-quarter team fouls (bonus awareness)
+# ----------------------------
+st.markdown("### Team fouls by quarter")
+st.dataframe(team_fouls_by_p, use_container_width=True, hide_index=True)
+
+# ----------------------------
+# Claims (data-backed), adapted to current game context
+# ----------------------------
+st.markdown("### Game insights & coaching context")
+
+def badge(text, kind="warn"):
+    return f"<span class='badge {kind}'>{text}</span>"
+
+insights = []
+# Check if either side hit bonus early in a quarter
+for p in periods:
+    p_mask = pbp["PERIOD"] == p
+    if not p_mask.any():
+        continue
+    first_idx = pbp.loc[p_mask].index[0]
+    # detect first bonus onsets
+    hb = pbp.loc[p_mask & (pbp['HOME_IN_BONUS'])].head(1)
+    ab = pbp.loc[p_mask & (pbp['AWAY_IN_BONUS'])].head(1)
+    if not hb.empty:
+        t = hb["PCTIMESTRING"].iloc[0]
+        insights.append(f"{badge('BONUS')} **{home_abbr}** entered the bonus in Q{p} at {t}, gifting free throws on defensive fouls for the rest of the quarter.")
+    if not ab.empty:
+        t = ab["PCTIMESTRING"].iloc[0]
+        insights.append(f"{badge('BONUS')} **{away_abbr}** entered the bonus in Q{p} at {t}, gifting free throws on defensive fouls for the rest of the quarter.")
+
+# Big ΔWP fouls
+if len(fouls):
+    swings = sorted(fouls, key=lambda x: abs(x.delta_wp_home), reverse=True)[:3]
+    for s in swings:
+        pov = "home"  # ΔWP displayed from home POV
+        swing = f"{s.delta_wp_home:+.1%}"
+        who = s.player or "Unknown"
+        insights.append(f"{badge('ΔWP','ok')} Q{s.period} {s.pc_time}: **{who}** ({s.team}) **{s.foul_type}** — ΔWP(home) {swing}.")
+
+if len(insights) == 0:
+    st.caption("No notable foul-related insights detected yet.")
+else:
+    for line in insights:
+        st.markdown(line, unsafe_allow_html=True)
+
+# ----------------------------
+# Footer: methodology
+# ----------------------------
+with st.expander("Methodology notes", expanded=False):
+    st.markdown(
+        "- **Data**: Free `nba_api` endpoints (play-by-play, box scores) for both regular season and playoffs.\n"
+        "- **Win Probability**: Transparent logistic baseline using score differential and time remaining. It's not the official NBA WP feed, but tracks swings and is stable for exploratory use.\n"
+        "- **ΔWP around fouls**: We use the next-event WP minus current WP as a quick proxy of the foul’s immediate impact.\n"
+        "- **Bonus detection**: Team reaches *bonus* at 5th team foul in a quarter; we shade those spans.\n"
+        "- **Foul trouble flags**: 2 fouls in Q1, 3 fouls by halftime, and 5 fouls in Q4+ (common coaching thresholds).\n"
+        "- **Mobile UX**: Plotly line + markers; pinch-zoom; legend toggles; readable labels.\n"
+    )
