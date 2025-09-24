@@ -149,7 +149,7 @@ def get_games_for_date(game_date_str: str) -> pd.DataFrame:
     # NBA expects MM/DD/YYYY
     month, day, year = game_date_str[5:7], game_date_str[8:10], game_date_str[0:4]
     req_date = f"{month}/{day}/{year}"
-    sb = ScoreboardV2(game_date=req_date, day_offset=DayOffset.default)
+    sb = ScoreboardV2(game_date=req_date, day_offset=0)  # <-- FIXED HERE
     games = sb.game_header.get_data_frame()
     return games
 
