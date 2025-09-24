@@ -4,9 +4,18 @@ import pandas as pd
 import streamlit as st
 import requests, re, json
 from datetime import datetime, timezone
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.express as px
+
+# Try to import plotly, fall back to matplotlib if not available
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    st.warning("⚠️ Plotly not available. Using basic charts. Install plotly for enhanced visualizations.")
 
 # ---- Streamlit setup
 st.set_page_config(page_title="RefLens Pro - NBA Game Analytics", layout="wide", initial_sidebar_state="expanded")
@@ -112,7 +121,7 @@ def enhanced_wp_model(score_margin: float, sec_remaining: float, period: int = 1
     
     return max(0.001, min(0.999, wp))  # Bound between 0.1% and 99.9%
 
-def detect_enhanced_fouls(row: pd.Series) -> tuple[bool, str, str, float]:
+def detect_enhanced_fouls(row: pd.Series) -> tuple[bool, str, float]:
     """Enhanced foul detection with severity scoring."""
     text = " ".join(
         str(x) for x in [
@@ -314,65 +323,72 @@ def create_enhanced_wp_chart(df: pd.DataFrame, meta: dict):
     """Create an enhanced win probability chart."""
     chart_data = df[df["wp_home"].notna()].copy()
     
-    fig = go.Figure()
-    
-    # Main WP line
-    fig.add_trace(go.Scatter(
-        x=chart_data.index,
-        y=chart_data["wp_home"] * 100,
-        mode='lines',
-        name='Home Win %',
-        line=dict(color='#1f77b4', width=2),
-        hovertemplate='Event %{x}<br>Home Win Prob: %{y:.1f}%<extra></extra>'
-    ))
-    
-    # Highlight significant momentum shifts
-    momentum_shifts = chart_data[chart_data["momentum_shift"] == 1]
-    if not momentum_shifts.empty:
+    if PLOTLY_AVAILABLE:
+        fig = go.Figure()
+        
+        # Main WP line
         fig.add_trace(go.Scatter(
-            x=momentum_shifts.index,
-            y=momentum_shifts["wp_home"] * 100,
-            mode='markers',
-            name='Momentum Shifts',
-            marker=dict(
-                color='red',
-                size=8,
-                symbol='diamond'
-            ),
-            hovertemplate='Momentum Shift<br>Event %{x}<br>WP: %{y:.1f}%<extra></extra>'
+            x=chart_data.index,
+            y=chart_data["wp_home"] * 100,
+            mode='lines',
+            name='Home Win %',
+            line=dict(color='#1f77b4', width=2),
+            hovertemplate='Event %{x}<br>Home Win Prob: %{y:.1f}%<extra></extra>'
         ))
-    
-    # Highlight fouls
-    fouls = chart_data[chart_data["is_foul"]]
-    if not fouls.empty:
-        colors = {'TECHNICAL': 'red', 'FLAGRANT': 'darkred', 'SHOOTING': 'orange', 'OFFENSIVE': 'purple'}
-        for foul_type in fouls['foul_type'].unique():
-            foul_subset = fouls[fouls['foul_type'] == foul_type]
+        
+        # Highlight significant momentum shifts
+        momentum_shifts = chart_data[chart_data["momentum_shift"] == 1]
+        if not momentum_shifts.empty:
             fig.add_trace(go.Scatter(
-                x=foul_subset.index,
-                y=foul_subset["wp_home"] * 100,
+                x=momentum_shifts.index,
+                y=momentum_shifts["wp_home"] * 100,
                 mode='markers',
-                name=f'{foul_type} Fouls',
+                name='Momentum Shifts',
                 marker=dict(
-                    color=colors.get(foul_type, 'gray'),
-                    size=6,
-                    symbol='x'
+                    color='red',
+                    size=8,
+                    symbol='diamond'
                 ),
-                hovertemplate=f'{foul_type} Foul<br>Event %{{x}}<br>WP: %{{y:.1f}}%<extra></extra>'
+                hovertemplate='Momentum Shift<br>Event %{x}<br>WP: %{y:.1f}%<extra></extra>'
             ))
-    
-    fig.update_layout(
-        title=f"Win Probability Timeline - {meta.get('away_tricode', 'Away')} @ {meta.get('home_tricode', 'Home')}",
-        xaxis_title="Game Events",
-        yaxis_title="Home Team Win Probability (%)",
-        height=500,
-        showlegend=True,
-        hovermode='x unified'
-    )
-    
-    fig.update_yaxis(range=[0, 100])
-    
-    return fig
+        
+        # Highlight fouls
+        fouls = chart_data[chart_data["is_foul"]]
+        if not fouls.empty:
+            colors = {'TECHNICAL': 'red', 'FLAGRANT': 'darkred', 'SHOOTING': 'orange', 'OFFENSIVE': 'purple'}
+            for foul_type in fouls['foul_type'].unique():
+                if foul_type:  # Skip empty foul types
+                    foul_subset = fouls[fouls['foul_type'] == foul_type]
+                    fig.add_trace(go.Scatter(
+                        x=foul_subset.index,
+                        y=foul_subset["wp_home"] * 100,
+                        mode='markers',
+                        name=f'{foul_type} Fouls',
+                        marker=dict(
+                            color=colors.get(foul_type, 'gray'),
+                            size=6,
+                            symbol='x'
+                        ),
+                        hovertemplate=f'{foul_type} Foul<br>Event %{{x}}<br>WP: %{{y:.1f}}%<extra></extra>'
+                    ))
+        
+        fig.update_layout(
+            title=f"Win Probability Timeline - {meta.get('away_tricode', 'Away')} @ {meta.get('home_tricode', 'Home')}",
+            xaxis_title="Game Events",
+            yaxis_title="Home Team Win Probability (%)",
+            height=500,
+            showlegend=True,
+            hovermode='x unified'
+        )
+        
+        fig.update_yaxis(range=[0, 100])
+        return fig
+    else:
+        # Fallback to streamlit line chart
+        chart_df = chart_data[["wp_home"]].copy()
+        chart_df["wp_home"] = chart_df["wp_home"] * 100
+        chart_df = chart_df.rename(columns={"wp_home": "Home Win %"})
+        return chart_df
 
 def analyze_officiating_impact(df: pd.DataFrame) -> dict:
     """Comprehensive officiating impact analysis."""
@@ -408,13 +424,25 @@ def analyze_officiating_impact(df: pd.DataFrame) -> dict:
         }
     
     # Statistical significance test (basic)
-    from scipy import stats
-    if len(fouls) > 10:  # Minimum sample size
-        t_stat, p_value = stats.ttest_1samp(fouls["dwp_obs"], 0)
-        statistically_significant = p_value < 0.05
-    else:
-        statistically_significant = False
-        p_value = None
+    try:
+        from scipy import stats
+        if len(fouls) > 10:  # Minimum sample size
+            t_stat, p_value = stats.ttest_1samp(fouls["dwp_obs"], 0)
+            statistically_significant = p_value < 0.05
+        else:
+            statistically_significant = False
+            p_value = None
+    except ImportError:
+        # Fallback without scipy - simple threshold test
+        if len(fouls) > 10:
+            mean_impact = fouls["dwp_obs"].mean()
+            std_impact = fouls["dwp_obs"].std()
+            # Simple 2-standard deviation rule
+            statistically_significant = abs(mean_impact) > 2 * (std_impact / np.sqrt(len(fouls)))
+            p_value = None
+        else:
+            statistically_significant = False
+            p_value = None
     
     return {
         "total_fouls": total_fouls,
@@ -511,7 +539,11 @@ if btn_fetch:
         
         # Enhanced WP Chart
         wp_chart = create_enhanced_wp_chart(df, meta)
-        st.plotly_chart(wp_chart, use_container_width=True)
+        if PLOTLY_AVAILABLE:
+            st.plotly_chart(wp_chart, use_container_width=True)
+        else:
+            st.subheader(f"Win Probability Timeline - {meta.get('away_tricode', 'Away')} @ {meta.get('home_tricode', 'Home')}")
+            st.line_chart(wp_chart, height=500)
         
         # Key metrics
         col1, col2, col3, col4 = st.columns(4)
@@ -545,21 +577,26 @@ if btn_fetch:
                     st.metric("Major Momentum Shifts", momentum_shifts)
                     
                     # Score margin over time
-                    fig_margin = go.Figure()
-                    fig_margin.add_trace(go.Scatter(
-                        x=df.index,
-                        y=df["score_margin"],
-                        mode='lines',
-                        name='Score Margin',
-                        line=dict(color='green', width=2)
-                    ))
-                    fig_margin.update_layout(
-                        title="Score Margin Over Time (Positive = Home Leading)",
-                        xaxis_title="Game Events",
-                        yaxis_title="Score Margin",
-                        height=400
-                    )
-                    st.plotly_chart(fig_margin, use_container_width=True)
+                    if PLOTLY_AVAILABLE:
+                        fig_margin = go.Figure()
+                        fig_margin.add_trace(go.Scatter(
+                            x=df.index,
+                            y=df["score_margin"],
+                            mode='lines',
+                            name='Score Margin',
+                            line=dict(color='green', width=2)
+                        ))
+                        fig_margin.update_layout(
+                            title="Score Margin Over Time (Positive = Home Leading)",
+                            xaxis_title="Game Events",
+                            yaxis_title="Score Margin",
+                            height=400
+                        )
+                        st.plotly_chart(fig_margin, use_container_width=True)
+                    else:
+                        st.subheader("Score Margin Over Time (Positive = Home Leading)")
+                        margin_chart = df[["score_margin"]].rename(columns={"score_margin": "Score Margin"})
+                        st.line_chart(margin_chart, height=400)
             
             with col2:
                 if show_advanced_metrics:
@@ -614,7 +651,10 @@ if btn_fetch:
                 
                 # Statistical significance
                 if officiating_analysis.get("statistically_significant"):
-                    st.warning(f"⚠️ Officiating bias may be statistically significant (p={officiating_analysis['p_value']:.3f})")
+                    if officiating_analysis.get("p_value"):
+                        st.warning(f"⚠️ Officiating bias may be statistically significant (p={officiating_analysis['p_value']:.3f})")
+                    else:
+                        st.warning("⚠️ Officiating bias may be statistically significant (simplified test)")
                 else:
                     st.info("ℹ️ No statistically significant officiating bias detected.")
             
