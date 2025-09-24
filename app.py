@@ -2,25 +2,23 @@ import time
 import numpy as np
 import pandas as pd
 import streamlit as st
-import requests, re, json
+import requests
+import re
 from datetime import datetime, timezone
 
-# Try to import plotly, fall back to matplotlib if not available
+# Try to import plotly, fall back to basic charts if not available
 try:
     import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
     import plotly.express as px
     PLOTLY_AVAILABLE = True
 except ImportError:
     PLOTLY_AVAILABLE = False
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-    st.warning("⚠️ Plotly not available. Using basic charts. Install plotly for enhanced visualizations.")
+    st.warning("⚠️ Plotly not available. Using basic charts.")
 
 # ---- Streamlit setup
-st.set_page_config(page_title="RefLens Pro - NBA Game Analytics", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="RefLens Pro - NBA Game Analytics", layout="wide")
 
-# Custom CSS for better styling
+# Custom CSS
 st.markdown("""
 <style>
     .metric-container {
@@ -63,13 +61,13 @@ st.markdown("""
 st.title("🏀 RefLens Pro - Advanced NBA Game Analytics")
 st.markdown("*Comprehensive game analysis with win probability, officiating insights, and performance metrics*")
 
-# Sidebar for inputs and controls
+# Sidebar
 with st.sidebar:
     st.header("Game Selection")
     game_id = st.text_input(
         "Enter NBA Game ID",
         value="0022300001",
-        help="Format: 00223xxxxx for 2023-24 season, 00224xxxxx for 2024-25 season"
+        help="Format: 00223xxxxx for 2023-24 season"
     )
     
     st.info("**Game ID Examples:**\n- Regular Season: 0022300001\n- Playoffs: 0042300101")
@@ -81,7 +79,7 @@ with st.sidebar:
     show_momentum_analysis = st.checkbox("Show Momentum Analysis", value=True)
     show_officiating_insights = st.checkbox("Show Officiating Insights", value=True)
 
-# ---- Constants & Enhanced Functions
+# Constants
 TOTAL_REG_SECS = 48 * 60
 
 def parse_period_clock_to_secs_left(period: int, pctimestr: str) -> int:
@@ -89,7 +87,7 @@ def parse_period_clock_to_secs_left(period: int, pctimestr: str) -> int:
     try:
         mm, ss = pctimestr.split(":")
         p_secs_left = int(mm) * 60 + int(ss)
-    except Exception:
+    except:
         p_secs_left = 0
     
     if period <= 4:
@@ -102,26 +100,23 @@ def parse_period_clock_to_secs_left(period: int, pctimestr: str) -> int:
     return max(0, total_secs)
 
 def enhanced_wp_model(score_margin: float, sec_remaining: float, period: int = 1) -> float:
-    """Enhanced win probability model accounting for game situation."""
-    # Base logistic model
+    """Enhanced win probability model."""
     time_factor = max(0, sec_remaining / TOTAL_REG_SECS)
     
-    # Enhanced coefficients based on research
-    margin_coeff = 0.18 if period <= 4 else 0.22  # Higher in OT
-    time_coeff = -0.0035 if sec_remaining > 300 else -0.008  # More volatile in final 5 minutes
+    margin_coeff = 0.18 if period <= 4 else 0.22
+    time_coeff = -0.0035 if sec_remaining > 300 else -0.008
     
-    # Situational adjustments
-    if sec_remaining < 120:  # Final 2 minutes
+    if sec_remaining < 120:
         margin_coeff *= 1.3
-    if sec_remaining < 30:   # Final 30 seconds
+    if sec_remaining < 30:
         margin_coeff *= 1.8
         
     z = margin_coeff * score_margin + time_coeff * sec_remaining
     wp = 1.0 / (1.0 + np.exp(-z))
     
-    return max(0.001, min(0.999, wp))  # Bound between 0.1% and 99.9%
+    return max(0.001, min(0.999, wp))
 
-def detect_enhanced_fouls(row: pd.Series) -> tuple[bool, str, float]:
+def detect_enhanced_fouls(row: pd.Series) -> tuple:
     """Enhanced foul detection with severity scoring."""
     text = " ".join(
         str(x) for x in [
@@ -161,16 +156,13 @@ def calculate_momentum_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """Calculate momentum and game flow metrics."""
     df = df.copy()
     
-    # Rolling averages for momentum
     window = 10
     df['margin_ma'] = df['score_margin'].rolling(window=window, min_periods=1).mean()
     df['wp_ma'] = df['wp_home'].rolling(window=window, min_periods=1).mean()
     
-    # Momentum shifts (significant WP changes)
     df['wp_change'] = df['wp_home'].diff().fillna(0)
     df['momentum_shift'] = (abs(df['wp_change']) > 0.05).astype(int)
     
-    # Game intensity (volatility in WP)
     df['wp_volatility'] = df['wp_home'].rolling(window=20, min_periods=5).std().fillna(0)
     
     return df
@@ -181,7 +173,6 @@ def _clock_to_mmss(clock_val) -> str:
         return "00:00"
     s = str(clock_val)
     
-    # ISO-like "PT11M25.00S"
     m = re.match(r"^PT(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$", s)
     if m:
         mm = int(m.group(1) or 0)
@@ -200,7 +191,6 @@ def load_enhanced_game_data(game_id: str):
     """Load and process game data with enhanced analytics."""
     url = f"https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_{game_id}.json"
 
-    # Fetch data with retry logic
     last_err = None
     data = None
     for i in range(3):
@@ -223,7 +213,6 @@ def load_enhanced_game_data(game_id: str):
     if not actions:
         raise ValueError("No play-by-play data found for this game ID.")
 
-    # Extract team and game metadata
     home = game.get("homeTeam", {})
     away = game.get("awayTeam", {})
     
@@ -235,27 +224,22 @@ def load_enhanced_game_data(game_id: str):
         "away_city": away.get("teamCity", ""),
         "away_name": away.get("teamName", ""),
         "game_time_utc": game.get("gameTimeUTC", ""),
-        "season_type": game.get("seasonType", ""),
-        "game_status": game.get("gameStatus", ""),
     }
     
-    # Parse game date
     game_date = ""
     try:
         if meta["game_time_utc"]:
             dt = datetime.fromisoformat(meta["game_time_utc"].replace("Z","+00:00"))
             game_date = dt.strftime("%B %d, %Y")
-    except Exception:
+    except:
         pass
     meta["game_date"] = game_date
 
-    # Process play-by-play data
     rows = []
     for i, action in enumerate(actions):
         period = int(action.get("period", 1))
         pctimestr = _clock_to_mmss(action.get("clock"))
         
-        # Scores
         sh = action.get("scoreHome")
         sa = action.get("scoreAway")
         
@@ -280,23 +264,19 @@ def load_enhanced_game_data(game_id: str):
 
     df = pd.DataFrame(rows).sort_values(["PERIOD", "EVENTNUM"]).reset_index(drop=True)
     
-    # Calculate derived metrics
     df["sec_remaining"] = df.apply(
         lambda r: parse_period_clock_to_secs_left(r["PERIOD"], r["PCTIMESTRING"]), axis=1
     )
     
-    # Forward fill scores
     df["home_score"] = df["home_score"].ffill()
     df["away_score"] = df["away_score"].ffill()
     df["score_margin"] = df["home_score"] - df["away_score"]
     
-    # Enhanced foul detection
     foul_data = df.apply(detect_enhanced_fouls, axis=1, result_type="expand")
     df["is_foul"] = foul_data[0]
     df["foul_type"] = foul_data[1]
     df["foul_severity"] = foul_data[2]
     
-    # Enhanced win probability
     mask = df["home_score"].notna() & df["away_score"].notna()
     df["wp_home"] = np.nan
     
@@ -309,34 +289,29 @@ def load_enhanced_game_data(game_id: str):
         )
         df.loc[idx, "wp_home"] = wp
     
-    # Calculate WP changes
     df["wp_next"] = df["wp_home"].shift(-1)
     df["wp_change"] = df["wp_home"].diff().fillna(0)
     df["dwp_obs"] = df["wp_next"] - df["wp_home"]
     
-    # Add momentum metrics
     df = calculate_momentum_metrics(df)
     
     return df, meta
 
-def create_enhanced_wp_chart(df: pd.DataFrame, meta: dict):
-    """Create an enhanced win probability chart."""
+def create_wp_chart(df: pd.DataFrame, meta: dict):
+    """Create win probability chart."""
     chart_data = df[df["wp_home"].notna()].copy()
     
     if PLOTLY_AVAILABLE:
         fig = go.Figure()
         
-        # Main WP line
         fig.add_trace(go.Scatter(
             x=chart_data.index,
             y=chart_data["wp_home"] * 100,
             mode='lines',
             name='Home Win %',
-            line=dict(color='#1f77b4', width=2),
-            hovertemplate='Event %{x}<br>Home Win Prob: %{y:.1f}%<extra></extra>'
+            line=dict(color='#1f77b4', width=2)
         ))
         
-        # Highlight significant momentum shifts
         momentum_shifts = chart_data[chart_data["momentum_shift"] == 1]
         if not momentum_shifts.empty:
             fig.add_trace(go.Scatter(
@@ -344,47 +319,30 @@ def create_enhanced_wp_chart(df: pd.DataFrame, meta: dict):
                 y=momentum_shifts["wp_home"] * 100,
                 mode='markers',
                 name='Momentum Shifts',
-                marker=dict(
-                    color='red',
-                    size=8,
-                    symbol='diamond'
-                ),
-                hovertemplate='Momentum Shift<br>Event %{x}<br>WP: %{y:.1f}%<extra></extra>'
+                marker=dict(color='red', size=8, symbol='diamond')
             ))
         
-        # Highlight fouls
         fouls = chart_data[chart_data["is_foul"]]
         if not fouls.empty:
-            colors = {'TECHNICAL': 'red', 'FLAGRANT': 'darkred', 'SHOOTING': 'orange', 'OFFENSIVE': 'purple'}
-            for foul_type in fouls['foul_type'].unique():
-                if foul_type:  # Skip empty foul types
-                    foul_subset = fouls[fouls['foul_type'] == foul_type]
-                    fig.add_trace(go.Scatter(
-                        x=foul_subset.index,
-                        y=foul_subset["wp_home"] * 100,
-                        mode='markers',
-                        name=f'{foul_type} Fouls',
-                        marker=dict(
-                            color=colors.get(foul_type, 'gray'),
-                            size=6,
-                            symbol='x'
-                        ),
-                        hovertemplate=f'{foul_type} Foul<br>Event %{{x}}<br>WP: %{{y:.1f}}%<extra></extra>'
-                    ))
+            fig.add_trace(go.Scatter(
+                x=fouls.index,
+                y=fouls["wp_home"] * 100,
+                mode='markers',
+                name='Fouls',
+                marker=dict(color='orange', size=6, symbol='x')
+            ))
         
         fig.update_layout(
-            title=f"Win Probability Timeline - {meta.get('away_tricode', 'Away')} @ {meta.get('home_tricode', 'Home')}",
+            title=f"Win Probability - {meta.get('away_tricode', 'Away')} @ {meta.get('home_tricode', 'Home')}",
             xaxis_title="Game Events",
             yaxis_title="Home Team Win Probability (%)",
             height=500,
-            showlegend=True,
-            hovermode='x unified'
+            showlegend=True
         )
         
         fig.update_yaxis(range=[0, 100])
         return fig
     else:
-        # Fallback to streamlit line chart
         chart_df = chart_data[["wp_home"]].copy()
         chart_df["wp_home"] = chart_df["wp_home"] * 100
         chart_df = chart_df.rename(columns={"wp_home": "Home Win %"})
@@ -397,47 +355,40 @@ def analyze_officiating_impact(df: pd.DataFrame) -> dict:
     if fouls.empty:
         return {"error": "No foul data available for analysis"}
     
-    # Basic metrics
     total_fouls = len(fouls)
     fouls_toward_home = (fouls["dwp_obs"] > 0).sum()
     fouls_toward_away = (fouls["dwp_obs"] < 0).sum()
-    neutral_fouls = (fouls["dwp_obs"] == 0).sum()
     
     pct_toward_home = (fouls_toward_home / total_fouls) * 100
     
-    # Impact analysis
     total_wp_impact = fouls["dwp_obs"].sum()
     avg_wp_impact = fouls["dwp_obs"].mean()
     
-    # Timing analysis
-    clutch_fouls = fouls[fouls["sec_remaining"] <= 300]  # Final 5 minutes
+    clutch_fouls = fouls[fouls["sec_remaining"] <= 300]
     clutch_impact = clutch_fouls["dwp_obs"].sum() if not clutch_fouls.empty else 0
     
-    # Severity analysis
     severity_impact = {}
     for foul_type in fouls["foul_type"].unique():
-        type_fouls = fouls[fouls["foul_type"] == foul_type]
-        severity_impact[foul_type] = {
-            "count": len(type_fouls),
-            "avg_impact": type_fouls["dwp_obs"].mean(),
-            "total_impact": type_fouls["dwp_obs"].sum()
-        }
+        if foul_type:
+            type_fouls = fouls[fouls["foul_type"] == foul_type]
+            severity_impact[foul_type] = {
+                "count": len(type_fouls),
+                "avg_impact": type_fouls["dwp_obs"].mean(),
+                "total_impact": type_fouls["dwp_obs"].sum()
+            }
     
-    # Statistical significance test (basic)
     try:
         from scipy import stats
-        if len(fouls) > 10:  # Minimum sample size
+        if len(fouls) > 10:
             t_stat, p_value = stats.ttest_1samp(fouls["dwp_obs"], 0)
             statistically_significant = p_value < 0.05
         else:
             statistically_significant = False
             p_value = None
     except ImportError:
-        # Fallback without scipy - simple threshold test
         if len(fouls) > 10:
             mean_impact = fouls["dwp_obs"].mean()
             std_impact = fouls["dwp_obs"].std()
-            # Simple 2-standard deviation rule
             statistically_significant = abs(mean_impact) > 2 * (std_impact / np.sqrt(len(fouls)))
             p_value = None
         else:
@@ -462,52 +413,50 @@ def generate_game_insights(df: pd.DataFrame, meta: dict, officiating_analysis: d
     """Generate actionable insights from the game data."""
     insights = []
     
-    # Game flow insights
-    final_wp = df["wp_home"].iloc[-1] if not df["wp_home"].isna().all() else 0.5
-    max_wp = df["wp_home"].max() if not df["wp_home"].isna().all() else 0.5
-    min_wp = df["wp_home"].min() if not df["wp_home"].isna().all() else 0.5
+    if df["wp_home"].notna().any():
+        final_wp = df["wp_home"].iloc[-1]
+        max_wp = df["wp_home"].max()
+        min_wp = df["wp_home"].min()
+        
+        if max_wp - min_wp > 0.6:
+            insights.append({
+                "type": "info",
+                "title": "High Volatility Game",
+                "message": f"This game featured significant momentum swings with win probability ranging from {min_wp*100:.1f}% to {max_wp*100:.1f}%."
+            })
+        
+        close_game_time = (df["wp_home"] > 0.4) & (df["wp_home"] < 0.6)
+        close_game_duration = close_game_time.sum()
+        
+        if close_game_duration > len(df) * 0.3:
+            insights.append({
+                "type": "success",
+                "title": "Competitive Game",
+                "message": f"The game remained competitive for {close_game_duration/len(df)*100:.1f}% of the events."
+            })
     
-    if max_wp - min_wp > 0.6:  # 60% swing
-        insights.append({
-            "type": "info",
-            "title": "High Volatility Game",
-            "message": f"This game featured significant momentum swings with win probability ranging from {min_wp*100:.1f}% to {max_wp*100:.1f}% for the home team."
-        })
-    
-    # Close game analysis
-    close_game_time = (df["wp_home"] > 0.4) & (df["wp_home"] < 0.6)
-    close_game_duration = close_game_time.sum()
-    
-    if close_game_duration > len(df) * 0.3:
-        insights.append({
-            "type": "success",
-            "title": "Competitive Game",
-            "message": f"The game remained competitive for {close_game_duration} events ({close_game_duration/len(df)*100:.1f}% of the game)."
-        })
-    
-    # Officiating insights
     if "error" not in officiating_analysis:
         pct_home = officiating_analysis["pct_toward_home"]
         total_impact = officiating_analysis["total_wp_impact"]
         
-        if abs(pct_home - 50) > 15:  # More than 15% deviation from 50/50
+        if abs(pct_home - 50) > 15:
             direction = "home" if pct_home > 50 else "away"
             insights.append({
                 "type": "warning",
                 "title": "Officiating Imbalance Detected",
-                "message": f"{pct_home:.1f}% of foul calls favored the {direction} team, with a total impact of {total_impact:+.3f} win probability points."
+                "message": f"{pct_home:.1f}% of foul calls favored the {direction} team, with a total impact of {total_impact:+.3f} WP points."
             })
         
         if officiating_analysis["clutch_impact"] != 0:
             insights.append({
                 "type": "info",
                 "title": "Clutch Time Officiating Impact",
-                "message": f"Foul calls in the final 5 minutes had a combined impact of {officiating_analysis['clutch_impact']:+.3f} win probability points."
+                "message": f"Foul calls in the final 5 minutes had a combined impact of {officiating_analysis['clutch_impact']:+.3f} WP points."
             })
     
     return insights
 
-# ---- Main Application Logic
+# Main Application
 if btn_fetch:
     with st.spinner("🔍 Fetching and analyzing game data..."):
         try:
@@ -537,32 +486,34 @@ if btn_fetch:
     with tab1:
         st.subheader("Win Probability Analysis")
         
-        # Enhanced WP Chart
-        wp_chart = create_enhanced_wp_chart(df, meta)
+        wp_chart = create_wp_chart(df, meta)
         if PLOTLY_AVAILABLE:
             st.plotly_chart(wp_chart, use_container_width=True)
         else:
             st.subheader(f"Win Probability Timeline - {meta.get('away_tricode', 'Away')} @ {meta.get('home_tricode', 'Home')}")
             st.line_chart(wp_chart, height=500)
         
-        # Key metrics
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            final_wp = df["wp_home"].iloc[-1] if not df["wp_home"].isna().all() else 0.5
-            st.metric("Final Home Win Prob", f"{final_wp*100:.1f}%")
+            if not df["wp_home"].isna().all():
+                final_wp = df["wp_home"].iloc[-1]
+                st.metric("Final Home Win Prob", f"{final_wp*100:.1f}%")
         
         with col2:
-            max_wp = df["wp_home"].max() if not df["wp_home"].isna().all() else 0.5
-            st.metric("Peak Home Win Prob", f"{max_wp*100:.1f}%")
+            if not df["wp_home"].isna().all():
+                max_wp = df["wp_home"].max()
+                st.metric("Peak Home Win Prob", f"{max_wp*100:.1f}%")
         
         with col3:
-            min_wp = df["wp_home"].min() if not df["wp_home"].isna().all() else 0.5
-            st.metric("Lowest Home Win Prob", f"{min_wp*100:.1f}%")
+            if not df["wp_home"].isna().all():
+                min_wp = df["wp_home"].min()
+                st.metric("Lowest Home Win Prob", f"{min_wp*100:.1f}%")
         
         with col4:
-            volatility = df["wp_volatility"].mean() if "wp_volatility" in df.columns else 0
-            st.metric("Average Volatility", f"{volatility:.3f}")
+            if "wp_volatility" in df.columns:
+                volatility = df["wp_volatility"].mean()
+                st.metric("Average Volatility", f"{volatility:.3f}")
     
     with tab2:
         if show_advanced_metrics or show_momentum_analysis:
@@ -573,10 +524,10 @@ if btn_fetch:
             with col1:
                 if show_momentum_analysis:
                     st.write("**Momentum Analysis**")
-                    momentum_shifts = (df["momentum_shift"] == 1).sum()
-                    st.metric("Major Momentum Shifts", momentum_shifts)
+                    if "momentum_shift" in df.columns:
+                        momentum_shifts = (df["momentum_shift"] == 1).sum()
+                        st.metric("Major Momentum Shifts", momentum_shifts)
                     
-                    # Score margin over time
                     if PLOTLY_AVAILABLE:
                         fig_margin = go.Figure()
                         fig_margin.add_trace(go.Scatter(
@@ -594,7 +545,7 @@ if btn_fetch:
                         )
                         st.plotly_chart(fig_margin, use_container_width=True)
                     else:
-                        st.subheader("Score Margin Over Time (Positive = Home Leading)")
+                        st.subheader("Score Margin Over Time")
                         margin_chart = df[["score_margin"]].rename(columns={"score_margin": "Score Margin"})
                         st.line_chart(margin_chart, height=400)
             
@@ -602,11 +553,9 @@ if btn_fetch:
                 if show_advanced_metrics:
                     st.write("**Game Flow Metrics**")
                     
-                    # Lead changes
                     lead_changes = ((df["score_margin"] > 0) != (df["score_margin"].shift(1) > 0)).sum()
                     st.metric("Lead Changes", lead_changes)
                     
-                    # Largest lead
                     max_home_lead = df["score_margin"].max()
                     max_away_lead = abs(df["score_margin"].min())
                     st.metric("Largest Home Lead", f"+{max_home_lead}")
@@ -619,7 +568,6 @@ if btn_fetch:
             officiating_analysis = analyze_officiating_impact(df)
             
             if "error" not in officiating_analysis:
-                # Key metrics
                 col1, col2, col3, col4 = st.columns(4)
                 
                 with col1:
@@ -634,7 +582,6 @@ if btn_fetch:
                 with col4:
                     st.metric("Clutch Time Fouls", officiating_analysis["clutch_fouls"])
                 
-                # Foul breakdown
                 st.write("**Foul Impact by Type**")
                 
                 severity_data = []
@@ -649,12 +596,11 @@ if btn_fetch:
                 if severity_data:
                     st.dataframe(pd.DataFrame(severity_data), use_container_width=True, hide_index=True)
                 
-                # Statistical significance
                 if officiating_analysis.get("statistically_significant"):
                     if officiating_analysis.get("p_value"):
                         st.warning(f"⚠️ Officiating bias may be statistically significant (p={officiating_analysis['p_value']:.3f})")
                     else:
-                        st.warning("⚠️ Officiating bias may be statistically significant (simplified test)")
+                        st.warning("⚠️ Officiating bias may be statistically significant")
                 else:
                     st.info("ℹ️ No statistically significant officiating bias detected.")
             
@@ -689,13 +635,11 @@ if btn_fetch:
                 </div>
                 """, unsafe_allow_html=True)
         
-        # Additional detailed analytics
         st.write("**Detailed Game Statistics**")
         
-        # Game summary stats
         total_events = len(df)
         total_fouls = (df["is_foul"] == True).sum()
-        foul_rate = (total_fouls / total_events) * 100
+        foul_rate = (total_fouls / total_events) * 100 if total_events > 0 else 0
         
         summary_cols = st.columns(3)
         with summary_cols[0]:
@@ -706,7 +650,6 @@ if btn_fetch:
             st.metric("Foul Rate", f"{foul_rate:.1f}%")
 
 else:
-    # Landing page
     st.markdown("""
     ## 🚀 Welcome to RefLens Pro
     
@@ -744,7 +687,7 @@ else:
     
     ### Sample Game IDs to Try:
     - **0022300001** - Season opener 2023-24
-    - **0022300500** - Mid-season game with interesting officiating
+    - **0022300500** - Mid-season game
     - **0042300101** - Playoff game (if available)
     
     ---
@@ -752,7 +695,6 @@ else:
     **Built with advanced statistical models and real NBA data from official sources.*
     """)
     
-    # Additional features section
     with st.expander("🔧 Advanced Features", expanded=False):
         st.markdown("""
         ### Statistical Models Used:
@@ -771,17 +713,6 @@ else:
         - Foul severity scoring system
         - Timing-based impact weighting
         - Bias detection with confidence intervals
-        
-        ### Data Sources:
-        - NBA Official Play-by-Play Data
-        - Real-time game statistics
-        - Historical performance baselines
-        
-        ### Technical Notes:
-        - All analysis is objective and data-driven
-        - Win probability bounded between 0.1% and 99.9%
-        - Overtime periods handled with enhanced coefficients
-        - Statistical significance testing for bias detection
         """)
     
     with st.expander("📖 Understanding the Metrics", expanded=False):
