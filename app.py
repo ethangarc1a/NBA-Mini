@@ -461,52 +461,88 @@ def summarize_foul_events(df: pd.DataFrame, home_abbr: str, away_abbr: str) -> L
 # ------------------------------------------------------------------------------------
 
 @st.cache_data(ttl=60*30)
-def _date_str(offset_days: int = 0) -> str:
-    from datetime import datetime, timedelta, timezone
-    now = datetime.now(timezone.utc) + timedelta(days=offset_days)
-    # NBA API expects local US date; we approximate with UTC->PT shift if you want, but this is usually fine
-    return now.strftime("%Y-%m-%d")
+def _date_str_from_date(d) -> str:
+    """Return YYYY-MM-DD for a datetime.date or pandas Timestamp."""
+    return pd.to_datetime(d).strftime("%Y-%m-%d")
+
 
 with st.sidebar:
     st.subheader("Pick a Game")
-    date_offset = st.slider("Day offset", -7, 7, 0, help="Browse games for days around today.")
-    date_str = _date_str(date_offset)
-    st.caption(f"Date: **{date_str}**")
 
-    sb = fetch_scoreboard(date_str)
-    if sb.empty:
-        st.error("No games on this date.")
-        st.stop()
+    # --- A) Wide date access (20 years back)
+    from datetime import date, timedelta
+    today = date.today()
+    twenty_years_ago = today - timedelta(days=365*20 + 5)  # a bit extra for leap years
 
-    # Build game choices
-    def label_row(r) -> str:
-        h = r.get("HOME_TEAM_ABBREVIATION") or r.get("HOME_TEAM_NAME") or "HOME"
-        a = r.get("VISITOR_TEAM_ABBREVIATION") or r.get("VISITOR_TEAM_NAME") or "AWAY"
-        status = r.get("GAME_STATUS_TEXT") or ""
-        return f"{a} @ {h}  {('— ' + status) if status else ''}"
+    picked_date = st.date_input(
+        "Date",
+        value=today,
+        min_value=twenty_years_ago,
+        max_value=today + timedelta(days=7),  # keep a small future window if schedules exist
+        help="Choose any date. Scoreboard loads all games for that day."
+    )
 
-    choices = []
-    index_map = []
-    for _, r in sb.iterrows():
-        gid = r.get("gameId") or r.get("GAME_ID")
-        if not gid:
-            continue
-        choices.append(label_row(r))
-        index_map.append(gid)
+    # quick jump arrows
+    prev_col, next_col = st.columns(2)
+    with prev_col:
+        if st.button("◀️ Previous day"):
+            picked_date = picked_date - timedelta(days=1)
+    with next_col:
+        if st.button("Next day ▶️"):
+            picked_date = picked_date + timedelta(days=1)
 
-    if not choices:
-        st.error("No valid games found for this date.")
-        st.stop()
+    date_str = _date_str_from_date(picked_date)
+    st.caption(f"Date selected: **{date_str}**")
 
-    sel = st.selectbox("Game", choices, index=0)
-    game_id = index_map[choices.index(sel)]
+    # --- B) Optional manual Game ID override
+    st.markdown("---")
+    manual_gid = st.text_input(
+        "Game ID (optional)",
+        value="",
+        placeholder="e.g., 0021900001 (regular season) or 0041900401 (playoffs)",
+        help="If provided, I’ll load this game directly and skip the date scoreboard."
+    ).strip()
 
-    # Options
+    # --- C) Load scoreboard for selected date *unless* a manual Game ID is present
+    if manual_gid:
+        game_id = manual_gid
+        sb = pd.DataFrame()  # no need to build choices
+        st.info("Using manual Game ID. Scoreboard is bypassed.")
+    else:
+        sb = fetch_scoreboard(date_str)
+        if sb.empty:
+            st.error("No games on this date (or data source unavailable). Try another date or paste a Game ID above.")
+            st.stop()
+
+        # Build select list (supports deep history)
+        def label_row(r) -> str:
+            h = r.get("HOME_TEAM_ABBREVIATION") or r.get("HOME_TEAM_NAME") or "HOME"
+            a = r.get("VISITOR_TEAM_ABBREVIATION") or r.get("VISITOR_TEAM_NAME") or "AWAY"
+            status = r.get("GAME_STATUS_TEXT") or ""
+            return f"{a} @ {h}" + (f" — {status}" if status else "")
+
+        choices, index_map = [], []
+        for _, r in sb.iterrows():
+            gid = r.get("gameId") or r.get("GAME_ID")
+            if not gid:
+                continue
+            choices.append(label_row(r))
+            index_map.append(gid)
+
+        if not choices:
+            st.error("No valid games found for this date. Try another date or paste a Game ID.")
+            st.stop()
+
+        sel = st.selectbox("Game", choices, index=0, help="Pick from all games on the selected day.")
+        game_id = index_map[choices.index(sel)]
+
+    # --- D) Display options
     st.markdown("**Options**")
     show_player_timeline = st.checkbox("Show player foul timelines", True)
     show_lead_tracker = st.checkbox("Show lead tracker (score diff)", True)
     show_bonus_bars = st.checkbox("Show team bonus bars", True)
     smooth_wp = st.checkbox("Mildly smooth WP line (visual)", True)
+
 
 # ------------------------------------------------------------------------------------
 # Load PBP and enrich
@@ -527,15 +563,17 @@ pbp = enrich_pbp(pbp_raw)
 fouls = summarize_foul_events(pbp, "HOME", "AWAY")
 
 # Figure out team names/abbr if present in scoreboard
-row_match = sb[sb["gameId"].astype(str) == str(game_id)]
+row_match = sb[sb["gameId"].astype(str) == str(game_id)] if not sb.empty else pd.DataFrame()
 if not row_match.empty:
     home_abbr = row_match.iloc[0].get("HOME_TEAM_ABBREVIATION") or "HOME"
     away_abbr = row_match.iloc[0].get("VISITOR_TEAM_ABBREVIATION") or "AWAY"
     home_name = row_match.iloc[0].get("HOME_TEAM_NAME") or home_abbr
     away_name = row_match.iloc[0].get("VISITOR_TEAM_NAME") or away_abbr
 else:
+    # Fallback labels when loading by Game ID only
     home_abbr, away_abbr = "HOME", "AWAY"
     home_name, away_name = "HOME", "AWAY"
+
 
 # ------------------------------------------------------------------------------------
 # Header & summary tags
